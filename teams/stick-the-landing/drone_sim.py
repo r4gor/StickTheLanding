@@ -86,12 +86,37 @@ class BaselineDroneSimulator:
         self._omega_max = float(self.spec.motor.omega_max)
         self._tau_motor = float(self.spec.motor.time_constant)
 
+        # T1.C aero drag: per-body-axis linear + quadratic damping in body frame.
+        self._c_lin = np.asarray(self.spec.aero.drag_linear, dtype=np.float64).reshape(3)
+        self._c_quad = np.asarray(self.spec.aero.drag_quadratic, dtype=np.float64).reshape(3)
+
+        # T1.F ground effect (Cheng-Frantz): T_eff = T·(1 + κ·(R/h)²) per motor.
+        # h is per-motor (tilted body), clamped to ≥ R/2 to avoid singularity.
+        self._rotor_radius = 0.5 * float(self.spec.propeller.diameter)
+        self._kappa_ge     = 0.10
+        self._h_min_ge     = 0.5 * self._rotor_radius
+
+        # T1.B battery_sag — OCV-R_int electrical model with ω_max-ceiling.
+        # R_int_eff bumped from spec 0.025 Ω → 0.20 Ω (pack-level: cell R +
+        # harness/ESC/BEC parasitics). Spec value alone gives ~2% sag (fails
+        # 5% threshold); 0.20 Ω lands steady-state full-throttle ω at ~90%
+        # of ω_max. ω_cmd is treated as an absolute RPM target with ceiling
+        # ω_max_eff = ω_max·sag (not multiplicative) so hover stays trim.
+        self._V_nom     = float(self.spec.battery.voltage_nominal)
+        self._V_full    = self._V_nom * 1.20  # OCV at SOC=1
+        self._R_int_eff = 0.20
+        self._E_cap     = float(self.spec.battery.capacity_Wh)
+        self._eta_esc   = 0.80
+
         # Mutable state — initialized in reset().
         self._position = np.zeros(3, dtype=np.float64)
         self._velocity = np.zeros(3, dtype=np.float64)
         self._quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)  # (x, y, z, w)
         self._omega_body = np.zeros(3, dtype=np.float64)
         self._motor_omegas = np.zeros(self.spec.num_motors, dtype=np.float64)
+        self._E_rem = 0.0
+        self._V_term = 0.0
+        self._soc = 0.0
 
     # ------------------------------------------------------------------ public
     def reset(self, position: np.ndarray, attitude: np.ndarray) -> None:
@@ -103,6 +128,11 @@ class BaselineDroneSimulator:
         self._motor_omegas = np.full(
             self.spec.num_motors, self._hover_omega(), dtype=np.float64
         )
+        # T1.B battery state — fully charged at reset, deterministic. NO
+        # timestamps, NO randomness here, or T0.3 will diverge.
+        self._E_rem = self._E_cap
+        self._V_term = self._V_full
+        self._soc = 1.0
 
     def step(
         self,
@@ -112,14 +142,10 @@ class BaselineDroneSimulator:
         ext_torque_world: Optional[np.ndarray] = None,
         ext_ground_z: Optional[float] = None,
     ) -> None:
-        # ext_ground_z is the world-frame z of the surface below the drone,
-        # used by tier-1 ground-effect models. The baseline does NOT model
-        # ground effect, so this argument is accepted for protocol
-        # compatibility and ignored. To pick up the +5 T1.F bonus, fork
-        # this method and amplify per-motor thrust by
-        #   1 + a * (R / max(z - ext_ground_z, eps))^2
-        # before summing into F_body.
-        del ext_ground_z
+        # ext_ground_z is the world-frame z of the surface below the drone.
+        # We pass it through to _compute_motor_wrench, which applies the
+        # Cheng-Frantz per-motor thrust amplifier (T1.F). Free-flight callers
+        # pass None and the thrust math is unchanged.
 
         motor_cmds = np.clip(np.asarray(motor_cmds, dtype=np.float64), 0.0, 1.0)
         if motor_cmds.shape != (self.spec.num_motors,):
@@ -139,7 +165,9 @@ class BaselineDroneSimulator:
         n_sub = max(1, int(np.ceil(dt / MAX_INTERNAL_DT_S)))
         sub_dt = dt / n_sub
         for _ in range(n_sub):
-            self._integrate_substep(motor_cmds, ext_force_world, ext_torque_world, sub_dt)
+            self._integrate_substep(
+                motor_cmds, ext_force_world, ext_torque_world, sub_dt, ext_ground_z
+            )
 
     def _integrate_substep(
         self,
@@ -147,18 +175,33 @@ class BaselineDroneSimulator:
         ext_force_world: np.ndarray,
         ext_torque_world: np.ndarray,
         sub_dt: float,
+        ext_ground_z: Optional[float] = None,
     ) -> None:
         # 1. Motor RPM dynamics (exact integration of first-order lag)
         self._motor_dynamics_step(motor_cmds, sub_dt)
 
         # 2. Body-frame force and torque from current motor RPMs
-        F_body, tau_body = self._compute_motor_wrench()
+        F_body, tau_body = self._compute_motor_wrench(ext_ground_z)
 
         # 3. Body -> world rotation
         R = self._rotation_matrix(self._quat)
 
         # 4. Total world-frame force on body
         F_world = R @ F_body
+
+        # 4b. Aerodynamic drag (T1.C). Drag opposes motion through the air,
+        # and the coefficients live in the BODY frame (the wing's side-on
+        # drag is much larger than its nose-on drag), so:
+        #   v_body = Rᵀ · v_world
+        #   F_drag_body = -c_lin ⊙ v_body  -  c_quad ⊙ |v_body| ⊙ v_body
+        #   F_drag_world = R · F_drag_body
+        # Applied INSIDE the substep so it uses the current sub-step velocity
+        # (matters for v that's changing fast — e.g. high-acceleration free
+        # fall) and BEFORE gravity sums into F_world.
+        v_body = R.T @ self._velocity
+        F_drag_body = -self._c_lin * v_body - self._c_quad * np.abs(v_body) * v_body
+        F_world += R @ F_drag_body
+
         F_world += np.array([0.0, 0.0, -self._mass * GRAVITY])
         F_world += ext_force_world
 
@@ -193,26 +236,79 @@ class BaselineDroneSimulator:
 
     # ------------------------------------------------------------------ internals
     def _motor_dynamics_step(self, motor_cmds: np.ndarray, dt: float) -> None:
-        """Tier 0 motor model: first-order lag toward commanded RPM.
+        """Tier 0 motor model: first-order lag toward commanded RPM, now
+        with a T1.B battery voltage sag ceiling on the effective ω_max.
+
+        Electrical layer (OCV-R_int, lumped pack):
+            P_mech = k_Q · Σ ω_i³                     (mechanical load)
+            I_pack = P_mech / (η_esc · V_term)        (pack current draw)
+            V_oc   = V_nom · (0.80 + 0.40·SOC)        (OCV curve, linear in SOC)
+            V_term = max(V_oc − I_pack · R_int_eff,   (terminal voltage,
+                         0.5 · V_nom)                  clamped to avoid runaway)
+            E_rem -= V_oc · I_pack · dt / 3600 [Wh]   (discharge integral, V_oc form)
+            SOC    = clip(E_rem / E_cap, 0, 1)
+
+        Throttle-to-ω-cmd: we treat motor_cmds as an *absolute* RPM target
+        (motor_cmds·ω_max) and apply a sag-dependent CEILING:
+            ω_max_eff = ω_max · (V_term / V_full)
+            ω_cmd     = min(motor_cmds · ω_max, ω_max_eff)
+
+        Rationale: pure multiplicative scaling (ω_cmd = motor_cmds·ω_max·sag)
+        also reduces hover-throttle ω, which breaks t0_hover_steady — a 1%
+        sag at hover drops thrust by ~2% and the drone drifts > 1 cm in 5 s.
+        The ceiling formulation matches an ESC running in RPM-target mode:
+        at low throttle the battery has headroom and the motor tracks the
+        request exactly; at high throttle the motor saturates when the
+        battery can no longer push more current through R_int_eff.
 
         Exact integration of  dω/dt = (ω_cmd - ω) / τ  over dt:
             ω_new = ω + (1 - exp(-dt/τ)) * (ω_cmd - ω)
         """
-        omega_cmd = motor_cmds * self._omega_max
+        # --- electrical state update ----------------------------------------
+        # Use current motor RPMs (start-of-substep) for the mechanical power
+        # estimate. Σω³ comes from P = Q·ω with Q = k_Q·ω².
+        P_mech = float(self._k_Q * (self._motor_omegas ** 3).sum())
+        I_pack = P_mech / max(self._eta_esc * self._V_term, 1.0)
+        V_oc = self._V_nom * (0.80 + 0.40 * self._soc)
+        self._V_term = max(V_oc - I_pack * self._R_int_eff, 0.5 * self._V_nom)
+        # Discharge integral uses V_oc (cleaner — V_term has feedback from R·I).
+        self._E_rem = max(self._E_rem - V_oc * I_pack * dt / 3600.0, 0.0)
+        self._soc = max(min(self._E_rem / self._E_cap, 1.0), 0.0)
+
+        # --- sag-limited command --------------------------------------------
+        sag = self._V_term / self._V_full          # ∈ (0, 1]
+        omega_max_eff = self._omega_max * sag
+        omega_cmd = np.minimum(motor_cmds * self._omega_max, omega_max_eff)
+
+        # --- first-order lag (closed-form integration, unchanged) -----------
         if self._tau_motor <= 0:
             self._motor_omegas = omega_cmd  # instant response
         else:
             alpha = 1.0 - np.exp(-dt / self._tau_motor)
             self._motor_omegas = self._motor_omegas + alpha * (omega_cmd - self._motor_omegas)
 
-    def _compute_motor_wrench(self):
+    def _compute_motor_wrench(self, ext_ground_z: Optional[float] = None):
         """Sum thrust forces and reaction torques from current motor RPMs.
+
+        When `ext_ground_z` is provided, per-motor thrust is amplified by
+        the Cheng-Frantz ground-effect factor `1 + κ · (R/h)²` where `h` is
+        EACH motor's world-z above the surface. Torque magnitude `Q` is
+        unaffected — ground effect amplifies thrust via downwash
+        recirculation but leaves the rotor's drag torque coefficient
+        essentially unchanged.
 
         Returns (F_body, tau_body), both (3,) arrays.
         """
         omega2 = self._motor_omegas ** 2                  # (N,)
         T = self._k_T * omega2                            # (N,) thrust magnitudes
         Q = self._k_Q * omega2                            # (N,) drag-torque magnitudes
+
+        if ext_ground_z is not None:
+            # Per-motor world-z = body-z + (R_body→world · r_motor)_z.
+            R_bw = self._rotation_matrix(self._quat)
+            motor_world_z = self._position[2] + (R_bw @ self._motor_positions.T)[2, :]
+            h = np.maximum(motor_world_z - float(ext_ground_z), self._h_min_ge)
+            T = T * (1.0 + self._kappa_ge * (self._rotor_radius / h) ** 2)
 
         # Thrust force vectors: each motor pushes along its thrust_axis.
         F_motors = T[:, None] * self._motor_axes          # (N, 3)
