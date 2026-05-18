@@ -23,7 +23,7 @@ simulator_features:
   tier_1:
     motor_lag:        false   # T1.A first-order RPM dynamics
     battery_sag:      false   # T1.B max thrust drops under sustained load
-    aero_drag:        false   # T1.C body drag opposes motion
+    aero_drag:        true   # T1.C body drag opposes motion
     cross_coupling:   false   # T1.D Newton-Euler ω×(I·ω) term
     substepping:      false   # T1.E internal sub-stepping for stiff dynamics
     ground_effect:    false   # T1.F thrust amplification from ext_ground_z

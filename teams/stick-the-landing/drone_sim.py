@@ -86,6 +86,14 @@ class BaselineDroneSimulator:
         self._omega_max = float(self.spec.motor.omega_max)
         self._tau_motor = float(self.spec.motor.time_constant)
 
+        # Tier-1 aerodynamic drag (T1.C): per-body-axis linear + quadratic
+        # damping coefficients. drag_linear ∈ R³ has units N/(m/s); drag_quadratic
+        # ∈ R³ has units N/(m/s)². Drag force is computed in the body frame
+        # (so an anisotropic vehicle — e.g. the VTOL wing — has different
+        # side, fore-aft, and vertical drag) then rotated back to world.
+        self._c_lin = np.asarray(self.spec.aero.drag_linear, dtype=np.float64).reshape(3)
+        self._c_quad = np.asarray(self.spec.aero.drag_quadratic, dtype=np.float64).reshape(3)
+
         # Mutable state — initialized in reset().
         self._position = np.zeros(3, dtype=np.float64)
         self._velocity = np.zeros(3, dtype=np.float64)
@@ -159,6 +167,20 @@ class BaselineDroneSimulator:
 
         # 4. Total world-frame force on body
         F_world = R @ F_body
+
+        # 4b. Aerodynamic drag (T1.C). Drag opposes motion through the air,
+        # and the coefficients live in the BODY frame (the wing's side-on
+        # drag is much larger than its nose-on drag), so:
+        #   v_body = Rᵀ · v_world
+        #   F_drag_body = -c_lin ⊙ v_body  -  c_quad ⊙ |v_body| ⊙ v_body
+        #   F_drag_world = R · F_drag_body
+        # Applied INSIDE the substep so it uses the current sub-step velocity
+        # (matters for v that's changing fast — e.g. high-acceleration free
+        # fall) and BEFORE gravity sums into F_world.
+        v_body = R.T @ self._velocity
+        F_drag_body = -self._c_lin * v_body - self._c_quad * np.abs(v_body) * v_body
+        F_world += R @ F_drag_body
+
         F_world += np.array([0.0, 0.0, -self._mass * GRAVITY])
         F_world += ext_force_world
 
