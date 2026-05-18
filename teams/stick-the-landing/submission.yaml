@@ -21,12 +21,12 @@ team:           "stick-the-landing"
 # automated test; failure = 0 points + dishonesty flag.
 simulator_features:
   tier_1:
-    motor_lag:        false   # T1.A first-order RPM dynamics
-    battery_sag:      false   # T1.B max thrust drops under sustained load
-    aero_drag:        true   # T1.C body drag opposes motion
-    cross_coupling:   false   # T1.D Newton-Euler ω×(I·ω) term
-    substepping:      false   # T1.E internal sub-stepping for stiff dynamics
-    ground_effect:    false   # T1.F thrust amplification from ext_ground_z
+    motor_lag:        true    # T1.A first-order RPM dynamics (baseline + AST diverged)
+    battery_sag:      true    # T1.B OCV-R_int with ω_max ceiling
+    aero_drag:        true    # T1.C body-frame linear + quadratic drag
+    cross_coupling:   true    # T1.D Newton-Euler ω×(I·ω) term (baseline + AST diverged)
+    substepping:      true    # T1.E internal sub-stepping (baseline + AST diverged)
+    ground_effect:    true    # T1.F Cheng-Frantz κ=0.10 per-motor amplifier
 
 # ----- Notes for the human reviewer (Tier 2 rubric, max 5 pts) -------------
 # 1-2 paragraphs. The reviewer will use this together with your code to
