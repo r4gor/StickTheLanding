@@ -58,6 +58,7 @@ def test_reset_returns_valid_obs(easy_env):
         "velocity",
         "attitude",
         "angular_velocity",
+        "motor_omegas",
     }
     assert obs["state"]["position"].shape == (3,)
     assert 0.0 <= obs["battery"] <= 1.0
