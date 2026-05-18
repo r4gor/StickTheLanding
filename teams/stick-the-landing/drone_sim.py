@@ -94,6 +94,12 @@ class BaselineDroneSimulator:
         self._c_lin = np.asarray(self.spec.aero.drag_linear, dtype=np.float64).reshape(3)
         self._c_quad = np.asarray(self.spec.aero.drag_quadratic, dtype=np.float64).reshape(3)
 
+        # T1.F ground effect (Cheng-Frantz): T_eff = T·(1 + κ·(R/h)²) per motor.
+        # h is per-motor (tilted body), clamped to ≥ R/2 to avoid singularity.
+        self._rotor_radius = 0.5 * float(self.spec.propeller.diameter)
+        self._kappa_ge     = 0.10
+        self._h_min_ge     = 0.5 * self._rotor_radius
+
         # Mutable state — initialized in reset().
         self._position = np.zeros(3, dtype=np.float64)
         self._velocity = np.zeros(3, dtype=np.float64)
@@ -120,14 +126,10 @@ class BaselineDroneSimulator:
         ext_torque_world: Optional[np.ndarray] = None,
         ext_ground_z: Optional[float] = None,
     ) -> None:
-        # ext_ground_z is the world-frame z of the surface below the drone,
-        # used by tier-1 ground-effect models. The baseline does NOT model
-        # ground effect, so this argument is accepted for protocol
-        # compatibility and ignored. To pick up the +5 T1.F bonus, fork
-        # this method and amplify per-motor thrust by
-        #   1 + a * (R / max(z - ext_ground_z, eps))^2
-        # before summing into F_body.
-        del ext_ground_z
+        # ext_ground_z is the world-frame z of the surface below the drone.
+        # We pass it through to _compute_motor_wrench, which applies the
+        # Cheng-Frantz per-motor thrust amplifier (T1.F). Free-flight callers
+        # pass None and the thrust math is unchanged.
 
         motor_cmds = np.clip(np.asarray(motor_cmds, dtype=np.float64), 0.0, 1.0)
         if motor_cmds.shape != (self.spec.num_motors,):
@@ -147,7 +149,9 @@ class BaselineDroneSimulator:
         n_sub = max(1, int(np.ceil(dt / MAX_INTERNAL_DT_S)))
         sub_dt = dt / n_sub
         for _ in range(n_sub):
-            self._integrate_substep(motor_cmds, ext_force_world, ext_torque_world, sub_dt)
+            self._integrate_substep(
+                motor_cmds, ext_force_world, ext_torque_world, sub_dt, ext_ground_z
+            )
 
     def _integrate_substep(
         self,
@@ -155,12 +159,13 @@ class BaselineDroneSimulator:
         ext_force_world: np.ndarray,
         ext_torque_world: np.ndarray,
         sub_dt: float,
+        ext_ground_z: Optional[float] = None,
     ) -> None:
         # 1. Motor RPM dynamics (exact integration of first-order lag)
         self._motor_dynamics_step(motor_cmds, sub_dt)
 
         # 2. Body-frame force and torque from current motor RPMs
-        F_body, tau_body = self._compute_motor_wrench()
+        F_body, tau_body = self._compute_motor_wrench(ext_ground_z)
 
         # 3. Body -> world rotation
         R = self._rotation_matrix(self._quat)
@@ -227,14 +232,28 @@ class BaselineDroneSimulator:
             alpha = 1.0 - np.exp(-dt / self._tau_motor)
             self._motor_omegas = self._motor_omegas + alpha * (omega_cmd - self._motor_omegas)
 
-    def _compute_motor_wrench(self):
+    def _compute_motor_wrench(self, ext_ground_z: Optional[float] = None):
         """Sum thrust forces and reaction torques from current motor RPMs.
+
+        When `ext_ground_z` is provided, per-motor thrust is amplified by
+        the Cheng-Frantz ground-effect factor `1 + κ · (R/h)²` where `h` is
+        EACH motor's world-z above the surface. Torque magnitude `Q` is
+        unaffected — ground effect amplifies thrust via downwash
+        recirculation but leaves the rotor's drag torque coefficient
+        essentially unchanged.
 
         Returns (F_body, tau_body), both (3,) arrays.
         """
         omega2 = self._motor_omegas ** 2                  # (N,)
         T = self._k_T * omega2                            # (N,) thrust magnitudes
         Q = self._k_Q * omega2                            # (N,) drag-torque magnitudes
+
+        if ext_ground_z is not None:
+            # Per-motor world-z = body-z + (R_body→world · r_motor)_z.
+            R_bw = self._rotation_matrix(self._quat)
+            motor_world_z = self._position[2] + (R_bw @ self._motor_positions.T)[2, :]
+            h = np.maximum(motor_world_z - float(ext_ground_z), self._h_min_ge)
+            T = T * (1.0 + self._kappa_ge * (self._rotor_radius / h) ** 2)
 
         # Thrust force vectors: each motor pushes along its thrust_axis.
         F_motors = T[:, None] * self._motor_axes          # (N, 3)
