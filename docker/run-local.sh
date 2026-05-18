@@ -25,6 +25,13 @@ MEMORY="${CHALLENGE_MEMORY:-8g}"
 # The published image is public — no login required.
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    if [[ "$IMAGE" == *":full"* ]]; then
+        echo "error: '$IMAGE' not found locally." >&2
+        echo "Pull the organizer image first:" >&2
+        echo "  docker pull --platform linux/amd64 ghcr.io/skyeusoftware/catch-the-boat:2026-hackathon" >&2
+        echo "  docker tag ghcr.io/skyeusoftware/catch-the-boat:2026-hackathon challenge-eval:full" >&2
+        exit 1
+    fi
     echo "Image '$IMAGE' not found locally. Building from docker/Dockerfile.eval ..." >&2
     docker build --load -f docker/Dockerfile.eval -t "$IMAGE" .
 fi
