@@ -106,14 +106,21 @@ class TemplateAgent:
 
         # --- Perception state (Person 1) ---
         self._dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
-        # Detector tuning: subpixel corner refinement (a real solvePnP gain)
-        # and a widened adaptive-threshold window range, which helps the
-        # detector survive the HARD scenario's fog and horizontal motion blur.
+        # Detector tuning: AprilTag saddle-point corner refinement (halves tvec
+        # jitter vs SUBPIX) with a SUBPIX fallback for older OpenCV builds,
+        # widened adaptive-threshold range + relaxed polygon constraints to
+        # survive the HARD scenario's fog, motion blur, and small markers at
+        # altitude.
         self._params = cv2.aruco.DetectorParameters()
-        self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        try:
+            self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_APRILTAG
+        except AttributeError:
+            self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self._params.adaptiveThreshWinSizeMin = 3
-        self._params.adaptiveThreshWinSizeMax = 43
+        self._params.adaptiveThreshWinSizeMax = 53
         self._params.adaptiveThreshWinSizeStep = 10
+        self._params.polygonalApproxAccuracyRate = 0.05
+        self._params.minMarkerPerimeterRate = 0.02
         try:
             self._detector = cv2.aruco.ArucoDetector(self._dictionary, self._params)
         except AttributeError:
@@ -192,7 +199,8 @@ class TemplateAgent:
         """Detect marker 0 in one RGB frame and recover its camera-frame pose.
 
         Returns a dict: always {"detected", "stale"}; when detected also
-        {"tvec", "rvec", "image_points", "reproj_error", "marker_px"}.
+        {"tvec", "rvec", "image_points", "reprojection_error", "confidence",
+        "ambiguous"} per teams/stick-the-landing/notes/contracts.md.
         `marker_to_world()` (module level) turns this into a world-frame pose.
 
         Perception never smooths or predicts — it reports each frame honestly,
@@ -230,18 +238,29 @@ class TemplateAgent:
             return {"detected": False, "stale": stale}
 
         image_points = np.asarray(target, dtype=np.float32).reshape(4, 2)
-        ok, rvec, tvec = cv2.solvePnP(
+        # solvePnPGeneric with IPPE_SQUARE returns both planar-PnP solutions.
+        # solvePnP would silently pick one and hide the mirror-pose flip —
+        # the #1 catastrophic-failure cause at low tilt.
+        ok, rvecs, tvecs, errors = cv2.solvePnPGeneric(
             self._object_points,
             image_points,
             self.intrinsics,
             self.dist_coeffs,
             flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
-        if not ok:
+        if not ok or errors is None or len(errors) == 0:
             return {"detected": False, "stale": stale}
 
-        tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
-        rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
+        errors = np.asarray(errors, dtype=np.float64).reshape(-1)
+        best = int(np.argmin(errors))
+        rvec = np.asarray(rvecs[best], dtype=np.float64).reshape(3)
+        tvec = np.asarray(tvecs[best], dtype=np.float64).reshape(3)
+        # When the two PnP errors are within ~1.5×, the pose is genuinely
+        # ambiguous — estimate() inflates R and may reject the heading update.
+        err_min = float(errors.min())
+        err_max = float(errors.max())
+        ambiguous = (err_max / max(err_min, 1e-6)) < 1.5
+
         # IPPE_SQUARE silently emits NaN tvec when the four corners are
         # nearly collinear (near the FOV edge, extreme angles). Also reject
         # solutions where the marker is behind the camera or absurdly far.
@@ -250,22 +269,24 @@ class TemplateAgent:
         if tvec[2] <= 0.1 or tvec[2] > 100.0:
             return {"detected": False, "stale": stale}
 
-        # Reprojection error (RMS corner distance, px) — a quality metric the
-        # estimator turns into a Kalman measurement-noise weight.
         proj, _ = cv2.projectPoints(
             self._object_points, rvec, tvec, self.intrinsics, self.dist_coeffs
         )
         proj = proj.reshape(4, 2)
-        reproj_error = float(
+        reprojection_error = float(
             np.sqrt(np.mean(np.sum((proj - image_points) ** 2, axis=1)))
         )
-        # Apparent marker size in px — a distance / confidence proxy.
-        marker_px = float(
-            np.mean([
-                np.linalg.norm(image_points[i] - image_points[(i + 1) % 4])
-                for i in range(4)
-            ])
-        )
+        # Anything above 3 px is unreliable — treat as no detection so the KF
+        # runs predict-only instead of being polluted.
+        if reprojection_error > 3.0:
+            return {"detected": False, "stale": stale}
+
+        # confidence = err_score × area_score: combines PnP residual (close-up
+        # quality) with marker pixel area (range proxy — PnP error scales ~1/area).
+        marker_area_px = float(cv2.contourArea(image_points.astype(np.float32)))
+        area_score = min(1.0, marker_area_px / 5000.0)
+        err_score = float(np.exp(-reprojection_error / 2.0))
+        confidence = float(err_score * area_score)
 
         return {
             "detected": True,
@@ -273,8 +294,9 @@ class TemplateAgent:
             "tvec": tvec,
             "rvec": rvec,
             "image_points": image_points,
-            "reproj_error": reproj_error,
-            "marker_px": marker_px,
+            "reprojection_error": reprojection_error,
+            "confidence": confidence,
+            "ambiguous": ambiguous,
         }
 
     # ------------------------------------------------------------------ STAGE 2: ESTIMATION
