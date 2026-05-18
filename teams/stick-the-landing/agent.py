@@ -1,43 +1,18 @@
-"""Baseline agent for the Catch the Boat challenge.
 
-What this agent does:
-    1. Detect the ArUco marker with cv2.aruco.ArucoDetector.
-    2. Estimate marker pose with cv2.solvePnP (IPPE_SQUARE).
-    3. Convert the marker's camera-frame translation to a world-frame
-       position using the drone's attitude.
-    4. Run a small state machine: SEARCH -> APPROACH -> DESCEND -> LAND.
-    5. Drive three independent PIDs (x, y, z) to produce high-level
-       (thrust, roll, pitch, yaw_rate) setpoints.
-    6. Map those setpoints to per-motor throttles via the stock
-       `DefaultAttitudeController`. The env's `step()` consumes
-       per-motor throttles, not high-level setpoints.
+"""StickTheLanding — competition agent for the Catch the Boat challenge.
 
-If you want to write your own attitude controller (and earn the control-
-fidelity portion of the sim-quality bonus), bypass step 6 and emit motor
-throttles directly from `control()`.
+Forked from agents/agent_template.py (the documented starting point), so
+`act()` is the locked orchestrator and the four pipeline stages are filled
+in independently:
 
-Deliberate weaknesses (improvement directions for teams):
-    - No prediction of boat motion: we always aim at the *current* marker
-      pose, so we lag behind a moving boat.
-    - No detection-jitter filter (no Kalman, no smoothing): every
-      detection is trusted as-is.
-    - No real recovery when the marker is briefly lost during descent.
-      We hold the last known position and hope it returns. With
-      occlusions, this leads to drift.
-    - Hardcoded thresholds for state transitions and a hardcoded prior
-      (origin) for cold-start search.
-    - No abort/retry logic if the descent is going wrong (e.g. drone
-      heading off the platform).
-    - Independent x/y/z PIDs ignore the cross-coupling caused by tilt.
-    - No active yaw control to align with boat heading — the wing-
-      perpendicular landing condition will fail unless the boat happens
-      to be aligned with the world x-axis at touchdown.
-    - LAND-phase descent is bang-bang (thrust pinned to its lower bound)
-      to brute-force through ground effect. Descent velocity often
-      saturates and forfeits the soft-landing bonus. A smooth descent
-      profile + velocity feed-forward both recover and stack.
+    perceive()  — Person 1: ArUco detection + pose recovery  [DONE]
+    estimate()  — Person 2: Kalman filter on boat (x, y, vx, vy) + heading  [DONE]
+    decide()    — Person 3: SEARCH / APPROACH / DESCEND / LAND state machine
+    control()   — Person 3: active yaw alignment + smooth descent
 
-Don't optimize the baseline. Fork agent_template.py and build your own.
+perceive() and estimate() are competition-grade; decide()/control() are the
+baseline-quality 3-PID + threshold state machine from agent_template.py and
+are next on the critical path (see teams/stick-the-landing/notes/control.md).
 """
 
 from pathlib import Path
@@ -51,6 +26,7 @@ from boat_landing.controllers import DefaultAttitudeController
 from boat_landing.drone_interface import DroneSpec, load_drone_spec
 
 
+# agent.py lives in teams/<team>/, so the repo root is three levels up.
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -75,6 +51,40 @@ def rpy_to_matrix(rpy) -> np.ndarray:
     Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
     Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
     return Rz @ Ry @ Rx
+
+
+def marker_to_world(perception: Dict, drone_state: Dict):
+    """Transform a camera-frame detection into a world-frame marker pose.
+
+    Returns (marker_world (3,), marker_yaw) or (None, None) when `perception`
+    holds no detection. The OpenCV camera axes map to the drone body axes as
+        cam_X = -body_y,  cam_Y = -body_x,  cam_Z = -body_z
+    (derived from the env's downward-camera view-matrix construction).
+    estimate() performs the same transform inline so the Kalman filter can
+    scale R with altitude; this helper is exposed for callers that just want
+    the world-frame pose without the filter.
+    """
+    if not perception.get("detected", False):
+        return None, None
+
+    tvec = np.asarray(perception["tvec"], dtype=np.float64).reshape(3)
+    pos = np.asarray(drone_state["position"], dtype=np.float64).reshape(3)
+    R_world_body = rpy_to_matrix(drone_state["attitude"])
+    body_x, body_y, body_z = (
+        R_world_body[:, 0], R_world_body[:, 1], R_world_body[:, 2]
+    )
+    # The camera sits CAMERA_BODY_OFFSET_Z along body z, below the COM.
+    camera_world = pos + body_z * CAMERA_BODY_OFFSET_Z
+    R_cam_to_world = np.column_stack([-body_y, -body_x, -body_z])
+    marker_world = camera_world + R_cam_to_world @ tvec
+
+    # Boat heading from the marker's in-plane rotation. The marker is painted
+    # axis-aligned on the platform, so its x-axis tracks the boat length axis
+    # up to a fixed offset (landing condition is yaw mod pi).
+    R_mc, _ = cv2.Rodrigues(np.asarray(perception["rvec"], dtype=np.float64))
+    R_mw = R_cam_to_world @ R_mc
+    marker_yaw = float(np.arctan2(R_mw[1, 0], R_mw[0, 0]))
+    return marker_world, marker_yaw
 
 
 def _wrap_mod_pi(angle: float) -> float:
@@ -324,24 +334,30 @@ class BaselineAgent:
         self.intrinsics = get_intrinsics()
         self.dist_coeffs = np.zeros(5, dtype=np.float64)
 
+        # --- Perception state (Person 1) ---
         self._dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
+        # Detector tuning: subpixel corner refinement (a real solvePnP gain)
+        # and a widened adaptive-threshold window range, which helps the
+        # detector survive the HARD scenario's fog and horizontal motion blur.
+        self._params = cv2.aruco.DetectorParameters()
+        self._params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self._params.adaptiveThreshWinSizeMin = 3
+        self._params.adaptiveThreshWinSizeMax = 43
+        self._params.adaptiveThreshWinSizeStep = 10
         try:
-            self._detector = cv2.aruco.ArucoDetector(
-                self._dictionary, cv2.aruco.DetectorParameters()
-            )
+            self._detector = cv2.aruco.ArucoDetector(self._dictionary, self._params)
         except AttributeError:
             self._detector = None  # OpenCV < 4.7 fallback path used in perceive()
 
-        # Marker corner ordering used by IPPE_SQUARE: TL, TR, BR, BL in the
-        # marker's own local frame, marker plane = z=0.
+        # CLAHE: local contrast equalisation, for fog robustness.
+        self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # Last raw-frame hash, for stale-frame detection in perceive().
+        self._last_frame_hash: Optional[int] = None
+        # Marker corner points in the marker's own frame, TL/TR/BR/BL — the
+        # order cv2.aruco.detectMarkers returns, as IPPE_SQUARE expects.
         h = MARKER_SIZE_M / 2.0
         self._object_points = np.array(
-            [
-                [-h,  h, 0.0],
-                [ h,  h, 0.0],
-                [ h, -h, 0.0],
-                [-h, -h, 0.0],
-            ],
+            [[-h,  h, 0.0], [ h,  h, 0.0], [ h, -h, 0.0], [-h, -h, 0.0]],
             dtype=np.float32,
         )
 
@@ -408,16 +424,38 @@ class BaselineAgent:
             "velocity": np.asarray(self._last_estimate.get("velocity", np.zeros(3))),
         }
 
-    # ------------------------------------------------------------------ perception
+    # ------------------------------------------------------------------ STAGE 1: PERCEPTION
     def perceive(self, camera_image: np.ndarray) -> Dict:
+        """Detect marker 0 in one RGB frame and recover its camera-frame pose.
+
+        Returns a dict: always {"detected", "stale"}; when detected also
+        {"tvec", "rvec", "image_points", "reprojection_error", "marker_px"}.
+        `marker_to_world()` (module level) turns this into a world-frame pose.
+
+        Perception never smooths or predicts — it reports each frame honestly,
+        including "no detection". Filtering is estimate()'s job.
+        """
+        # Stale-frame detection: when the scenario fps < 50 the env repeats
+        # the previous frame. Hashing the raw bytes lets estimate() skip a
+        # duplicate measurement (applying it twice falsely shrinks the KF
+        # covariance).
+        frame_hash = hash(camera_image.tobytes())
+        stale = frame_hash == self._last_frame_hash
+        self._last_frame_hash = frame_hash
+
         gray = cv2.cvtColor(camera_image, cv2.COLOR_RGB2GRAY)
+        # CLAHE restores marker contrast under the Beer-Lambert fog blend.
+        gray = self._clahe.apply(gray)
+
         if self._detector is not None:
             corners, ids, _ = self._detector.detectMarkers(gray)
         else:
-            corners, ids, _ = cv2.aruco.detectMarkers(gray, self._dictionary)
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self._dictionary, parameters=self._params
+            )
 
         if ids is None or len(ids) == 0:
-            return {"detected": False}
+            return {"detected": False, "stale": stale}
 
         # Only marker ID 0 matters for this challenge.
         target = None
@@ -426,9 +464,9 @@ class BaselineAgent:
                 target = c
                 break
         if target is None:
-            return {"detected": False}
+            return {"detected": False, "stale": stale}
 
-        image_points = target.reshape(4, 2).astype(np.float32)
+        image_points = np.asarray(target, dtype=np.float32).reshape(4, 2)
         ok, rvec, tvec = cv2.solvePnP(
             self._object_points,
             image_points,
@@ -437,24 +475,44 @@ class BaselineAgent:
             flags=cv2.SOLVEPNP_IPPE_SQUARE,
         )
         if not ok:
-            return {"detected": False}
+            return {"detected": False, "stale": stale}
 
         tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
         rvec = np.asarray(rvec, dtype=np.float64).reshape(3)
         # IPPE_SQUARE silently emits NaN tvec when the four corners are
-        # nearly collinear (near the FOV edge, extreme angles). Also
-        # reject solutions where the marker is behind the camera or
-        # absurdly far. Both manifest as garbage downstream.
+        # nearly collinear (near the FOV edge, extreme angles). Also reject
+        # solutions where the marker is behind the camera or absurdly far.
         if not (np.all(np.isfinite(tvec)) and np.all(np.isfinite(rvec))):
-            return {"detected": False}
+            return {"detected": False, "stale": stale}
         if tvec[2] <= 0.1 or tvec[2] > 100.0:
-            return {"detected": False}
+            return {"detected": False, "stale": stale}
+
+        # Reprojection error (RMS corner distance, px) — a quality metric the
+        # estimator turns into a Kalman measurement-noise weight. Name matches
+        # contracts.md ("reprojection_error", not abbreviated).
+        proj, _ = cv2.projectPoints(
+            self._object_points, rvec, tvec, self.intrinsics, self.dist_coeffs
+        )
+        proj = proj.reshape(4, 2)
+        reprojection_error = float(
+            np.sqrt(np.mean(np.sum((proj - image_points) ** 2, axis=1)))
+        )
+        # Apparent marker size in px — a distance / confidence proxy.
+        marker_px = float(
+            np.mean([
+                np.linalg.norm(image_points[i] - image_points[(i + 1) % 4])
+                for i in range(4)
+            ])
+        )
 
         return {
             "detected": True,
+            "stale": stale,
             "tvec": tvec,
             "rvec": rvec,
             "image_points": image_points,
+            "reprojection_error": reprojection_error,
+            "marker_px": marker_px,
         }
 
     # ------------------------------------------------------------------ estimation
@@ -488,6 +546,10 @@ class BaselineAgent:
             return self._build_estimate_output(updated=False, from_prior=False)
 
         detected = bool(perception.get("detected", False))
+        # Skip duplicate frames: applying the same measurement twice falsely
+        # shrinks the KF covariance. perceive() flags this via "stale".
+        if detected and bool(perception.get("stale", False)):
+            detected = False
         tvec = perception.get("tvec")
         rvec = perception.get("rvec")
         if detected:
