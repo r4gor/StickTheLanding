@@ -45,6 +45,7 @@ boat_estimate = {
     "heading_rate":  float | None,      # [rad/s]
     "position_cov":  np.ndarray (3,3) | None,  # KF covariance — lets decide() abort
     "velocity_cov":  np.ndarray (3,3) | None,
+    "confidence":    float | None,      # 0..1 scalar; KF derives from trace(P_pos). Lets decide() write `if confidence > 0.7: commit_soft = True` without inverting matrices.
 }
 ```
 
@@ -88,7 +89,50 @@ Same signature, same output `(N,) ∈ [0,1]`. Internally, control reads:
 
 ## `get_last_estimate() → {position, velocity}`
 
-Exposes the boat estimate for the scoring bonus (0–15 pts via RMSE). Keep returning `velocity` populated — that's table-stake under the new schema.
+Exposes the boat estimate for the scoring bonus (0–15 pts). Per `scorer.py:37-44`, the formula is `15 * (1 - min(rmse, 2.0) / 2.0)` using **2D XY position only** — z and velocity are in the return dict for convention but not scored. Keep returning `velocity` anyway because `control()` reads it.
+
+Also: this method must keep returning a valid estimate during the **recovery test** (camera blacked out by `occlusion_window`). KF predict-only handles that — just don't return `None` while occluded.
+
+---
+
+## `act_setpoint(obs) → (thrust_norm, roll, pitch, yaw_rate)` ← NEW, earns +15 pts FC-compat
+
+`evaluate.py:146-163` checks for this method **by name**. Its presence alone earns the FC-compatibility bonus (no format validation on the output). Tuple shape is exactly `(thrust_norm: float, roll: float, pitch: float, yaw_rate: float)` — the four high-level setpoints the cascade already computes.
+
+Recommended implementation: refactor `control()` into a private `_control_setpoints()` that returns the 4-tuple, then have both `control()` and `act_setpoint()` call it:
+
+```python
+def _control_setpoints(self, state, boat_estimate, phase_out):
+    # ... existing control logic ...
+    return {"thrust": thrust_cmd, "roll": roll_cmd,
+            "pitch": pitch_cmd, "yaw_rate": yaw_rate_cmd}
+
+def control(self, state, boat_estimate, phase_out):
+    sp = self._control_setpoints(state, boat_estimate, phase_out)
+    return self.attitude_ctrl(state, sp["roll"], sp["pitch"],
+                              sp["yaw_rate"], sp["thrust"])
+
+def act_setpoint(self, obs):
+    p  = self.perceive(obs["camera"])
+    be = self.estimate(p, obs["state"])
+    po = self.decide(obs["state"], be, obs["battery"], obs["time"])
+    sp = self._control_setpoints(obs["state"], be, po)
+    return (sp["thrust"], sp["roll"], sp["pitch"], sp["yaw_rate"])
+```
+
+Additive: `control()` signature unchanged, baseline `act()` unchanged. The control-stage owner does this refactor; nobody else has to coordinate.
+
+---
+
+## NaN / Inf sanitization (mandatory)
+
+`scorer.py:128-143` **forces non-finite inputs to worst-case defaults** (NaN landing-error → 1.5 m → zero precision; NaN battery → 0 → 0.3 floor; NaN descent-vel → ∞ → no soft-landing bonus). Emitting NaN is therefore worse than emitting `None`. **Every numeric field above must be either finite or `None`** — never NaN/Inf.
+
+Concretely:
+- `perceive()` must return `"detected": False` (not `True` with NaN tvec). Baseline already guards this — keep it.
+- `estimate()` must guard against NaN propagation (e.g., NaN drone yaw → world transform NaN).
+- `_control_setpoints()` clamps every output to a finite range before returning.
+- Baseline has a hover fallback in `act()` (`if not np.all(np.isfinite(action))`) — keep it.
 
 ---
 
