@@ -26,13 +26,22 @@ MEMORY="${CHALLENGE_MEMORY:-8g}"
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     echo "Image '$IMAGE' not found locally. Building from docker/Dockerfile.eval ..." >&2
-    docker build -f docker/Dockerfile.eval -t "$IMAGE" .
+    docker build --load -f docker/Dockerfile.eval -t "$IMAGE" .
+fi
+
+# Use amd64 emulation only for the organizer :full image (no ARM64 manifest).
+# The locally-built :base image is native ARM64 and must NOT force amd64.
+# Intentionally unquoted below so empty string adds no argument.
+PLATFORM_FLAG=""
+if [[ "$IMAGE" == *":full"* ]]; then
+    PLATFORM_FLAG="--platform linux/amd64"
 fi
 
 # --network host: gives the container the host's network so participants
 # who pull artifacts from the internet during dev don't hit DNS issues.
 # Drop it if your eval policy forbids network at scoring time.
 exec docker run --rm -it \
+    $PLATFORM_FLAG \
     --cpus="$CPUS" \
     --memory="$MEMORY" \
     --user "$(id -u):$(id -g)" \
