@@ -15,6 +15,7 @@ baseline-quality 3-PID + threshold state machine from agent_template.py and
 are next on the critical path (see teams/stick-the-landing/notes/control.md).
 """
 
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -368,6 +369,38 @@ class BaselineAgent:
             dtype=np.float32,
         )
 
+        # Dark-channel defog parameters (He et al. 2009). Always-on, runs at
+        # 1/4 resolution and the transmission map is upsampled to full size.
+        self._defog_omega = 0.95
+        self._defog_t0 = 0.1
+        self._defog_scale = 4
+        self._defog_gf_radius = 15
+        self._defog_gf_eps = 1e-3
+        self._defog_kernel = np.ones((7, 7), dtype=np.uint8)
+
+        # Wiener deconvolution kernel for horizontal 1x3 box motion blur,
+        # the worst case the env applies (camera.apply_motion_blur).
+        # Precomputed FFT — used on the fallback path when ArUco misses.
+        # Kernel is centered (zero-phase) so the deconvolution preserves
+        # pixel alignment.
+        self._wiener_nsr = 0.01
+        _kpad = np.zeros((480, 640), dtype=np.float32)
+        _kpad[0, -1] = 1.0 / 3.0
+        _kpad[0, 0] = 1.0 / 3.0
+        _kpad[0, 1] = 1.0 / 3.0
+        self._wiener_K = np.fft.rfft2(_kpad)
+
+        # CNN corner-regressor fallback. Lazy-loaded; failure non-fatal.
+        self._cnn_net = None
+        self._cnn_ready = False
+        self._try_load_cnn()
+
+        # Cache of the previous perception dict — stale frames (the env's
+        # camera fps < 50 produces byte-identical repeats) return the cached
+        # result instead of re-running defog/ArUco/Wiener. estimate() still
+        # ignores stale measurements; the cache is purely a latency win.
+        self._last_perception: Optional[Dict] = None
+
         # PID gains tuned for stability rather than aggressiveness — leave
         # plenty of room for teams to push performance up. With Kp/Kd
         # ratio fixed, the closed-loop velocity at error e is roughly
@@ -432,17 +465,34 @@ class BaselineAgent:
         }
 
     # ------------------------------------------------------------------ STAGE 1: PERCEPTION
+    # Per-source confidence prior. ArUco direct is trusted; deconv-recovered
+    # detections get a modest haircut; CNN-regressed corners are the most
+    # uncertain. estimate() turns confidence into R-scale at line ~617.
+    _SOURCE_PRIOR = {"aruco": 1.0, "deconv": 0.7, "cnn": 0.5}
+
     def perceive(self, camera_image: np.ndarray) -> Dict:
         """Detect marker 0 in one RGB frame and recover its camera-frame pose.
 
         Returns a dict: always {"detected", "stale"}; when detected also
         {"tvec", "rvec", "image_points", "reprojection_error", "confidence",
-        "ambiguous"} per teams/stick-the-landing/notes/contracts.md.
+        "ambiguous", "source"} per teams/stick-the-landing/notes/contracts.md.
         `marker_to_world()` (module level) turns this into a world-frame pose.
+
+        Cascade (HARD/recovery survivability — Tip #5):
+            rgb -> dark_channel_defog -> gray -> CLAHE -> ArUco        ("aruco")
+                (miss) -> Wiener deblur -> ArUco                       ("deconv")
+                (miss) -> CNN corner regressor + solvePnP              ("cnn")
+                (miss) -> {detected: False}
+
+        Defog is always-on (cheap; recovers fog-attenuated contrast on top of
+        CLAHE). Wiener and CNN run only on miss to avoid ringing/CNN-noise on
+        clean frames. The CNN path is also latency-gated.
 
         Perception never smooths or predicts — it reports each frame honestly,
         including "no detection". Filtering is estimate()'s job.
         """
+        t0 = time.perf_counter()
+
         # Stale-frame detection: when the scenario fps < 50 the env repeats
         # the previous frame. Hashing the raw bytes lets estimate() skip a
         # duplicate measurement (applying it twice falsely shrinks the KF
@@ -451,30 +501,100 @@ class BaselineAgent:
         stale = frame_hash == self._last_frame_hash
         self._last_frame_hash = frame_hash
 
-        gray = cv2.cvtColor(camera_image, cv2.COLOR_RGB2GRAY)
+        # Stale short-circuit: re-running defog + ArUco on a byte-identical
+        # frame produces the same answer at full cost. Return the cached dict
+        # with stale=True so estimate() drops it but downstream tooling still
+        # sees the previous detection state.
+        if stale and self._last_perception is not None:
+            cached = dict(self._last_perception)
+            cached["stale"] = True
+            return cached
+
+        # A: Always-on dark-channel defog before CLAHE.
+        rgb_defogged = self._defog_dark_channel(camera_image)
+        gray = cv2.cvtColor(rgb_defogged, cv2.COLOR_RGB2GRAY)
         # CLAHE restores marker contrast under the Beer-Lambert fog blend.
         gray = self._clahe.apply(gray)
 
+        image_points, n_rejected = self._aruco_detect(gray)
+        if image_points is not None:
+            result = self._solve_pose_from_corners(
+                image_points, stale, source="aruco"
+            )
+            if result["detected"]:
+                self._last_perception = result
+                return result
+
+        # B: Wiener deconv fallback — only when ArUco saw quad candidates
+        # but couldn't decode marker 0. If n_rejected == 0 the frame has no
+        # marker-shaped polygons; deblur cannot synthesize them. Also
+        # latency-gated: on heavy noise the first ArUco pass alone burns
+        # the budget; a second pass would push perceive() above 100 ms.
+        if n_rejected > 0 and (time.perf_counter() - t0) < 0.012:
+            gray_dbl = self._deblur_wiener(gray)
+            result = self._aruco_and_pose(gray_dbl, stale, source="deconv")
+            if result["detected"]:
+                self._last_perception = result
+                return result
+
+        # C: CNN corner regressor — latency-gated. Runs even when n_rejected
+        # is 0 because the CNN can pick up the marker from low-level features
+        # ArUco's polygon-first pipeline misses (e.g. heavy fog + small marker).
+        if self._cnn_ready and (time.perf_counter() - t0) < 0.015:
+            pred_corners = self._cnn_corners(camera_image)
+            if pred_corners is not None:
+                result = self._solve_pose_from_corners(
+                    pred_corners, stale, source="cnn"
+                )
+                if result["detected"]:
+                    self._last_perception = result
+                    return result
+
+        miss = {"detected": False, "stale": stale}
+        self._last_perception = miss
+        return miss
+
+    # ------------------------------------------------------------------ cascade helpers
+    def _aruco_detect(self, gray: np.ndarray):
+        """Detect marker 0 in a grayscale frame. Returns
+        ``(image_points or None, num_rejected_candidates)``.
+
+        The rejected count is what makes the cascade affordable: if ArUco
+        saw zero polygon candidates the frame is featureless and Wiener
+        deblur cannot manufacture marker structure from noise — skip it
+        instead of paying the second adaptive-threshold scan (~50 ms with
+        the widened win-size range tuned for HARD fog).
+        """
         if self._detector is not None:
-            corners, ids, _ = self._detector.detectMarkers(gray)
+            corners, ids, rejected = self._detector.detectMarkers(gray)
         else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
+            corners, ids, rejected = cv2.aruco.detectMarkers(
                 gray, self._dictionary, parameters=self._params
             )
-
+        n_rejected = 0 if rejected is None else len(rejected)
         if ids is None or len(ids) == 0:
-            return {"detected": False, "stale": stale}
-
-        # Only marker ID 0 matters for this challenge.
-        target = None
+            return None, n_rejected
         for c, i in zip(corners, ids.flatten()):
             if int(i) == 0:
-                target = c
-                break
-        if target is None:
-            return {"detected": False, "stale": stale}
+                return np.asarray(c, dtype=np.float32).reshape(4, 2), n_rejected
+        return None, n_rejected
 
-        image_points = np.asarray(target, dtype=np.float32).reshape(4, 2)
+    def _aruco_and_pose(
+        self, gray: np.ndarray, stale: bool, source: str,
+    ) -> Dict:
+        """Run ArUco + IPPE_SQUARE solvePnP on a preprocessed grayscale frame.
+        Returns the perception dict (with `source` tag) or
+        ``{detected: False, stale}`` on miss/reject."""
+        image_points, _ = self._aruco_detect(gray)
+        if image_points is None:
+            return {"detected": False, "stale": stale}
+        return self._solve_pose_from_corners(image_points, stale, source)
+
+    def _solve_pose_from_corners(
+        self, image_points: np.ndarray, stale: bool, source: str,
+    ) -> Dict:
+        """IPPE_SQUARE pose + confidence on four corner pixels. Shared by the
+        ArUco / deconv / CNN paths."""
         # solvePnPGeneric with IPPE_SQUARE returns both planar-PnP solutions.
         # solvePnP would silently pick one and hide the mirror-pose flip —
         # the #1 catastrophic-failure cause at low tilt.
@@ -492,8 +612,6 @@ class BaselineAgent:
         best = int(np.argmin(errors))
         rvec = np.asarray(rvecs[best], dtype=np.float64).reshape(3)
         tvec = np.asarray(tvecs[best], dtype=np.float64).reshape(3)
-        # When the two PnP errors are within ~1.5×, the pose is genuinely
-        # ambiguous — estimate() inflates R and may reject the heading update.
         err_min = float(errors.min())
         err_max = float(errors.max())
         ambiguous = (err_max / max(err_min, 1e-6)) < 1.5
@@ -518,12 +636,11 @@ class BaselineAgent:
         if reprojection_error > 3.0:
             return {"detected": False, "stale": stale}
 
-        # confidence = err_score × area_score: combines PnP residual (close-up
-        # quality) with marker pixel area (range proxy — PnP error scales ~1/area).
         marker_area_px = float(cv2.contourArea(image_points.astype(np.float32)))
         area_score = min(1.0, marker_area_px / 5000.0)
         err_score = float(np.exp(-reprojection_error / 2.0))
-        confidence = float(err_score * area_score)
+        source_prior = self._SOURCE_PRIOR.get(source, 1.0)
+        confidence = float(err_score * area_score * source_prior)
 
         return {
             "detected": True,
@@ -534,7 +651,135 @@ class BaselineAgent:
             "reprojection_error": reprojection_error,
             "confidence": confidence,
             "ambiguous": ambiguous,
+            "source": source,
         }
+
+    # ------------------------------------------------------------------ defog
+    def _defog_dark_channel(self, rgb: np.ndarray) -> np.ndarray:
+        """Single-image dehazing via dark-channel prior (He et al. 2009).
+
+        Compute the dark-channel transmission map at 1/4 resolution, refine
+        with a guided filter, upsample, then invert the haze blend
+        `I = t * J + (1 - t) * A` for `J`. Always-on so contrast restoration
+        compounds with CLAHE downstream. Targets ~3-5 ms on the eval CPU.
+        """
+        h, w = rgb.shape[:2]
+        qw = max(1, w // self._defog_scale)
+        qh = max(1, h // self._defog_scale)
+        rgb_small = cv2.resize(rgb, (qw, qh), interpolation=cv2.INTER_AREA)
+        rgb_small_f = rgb_small.astype(np.float32)
+
+        # Atmospheric light A: brightest 0.1% pixels of the small dark channel
+        # define the haze color we will subtract back out.
+        dark_small = np.min(rgb_small_f, axis=2)
+        dark_small = cv2.erode(dark_small, self._defog_kernel)
+        flat = dark_small.ravel()
+        n = flat.size
+        k = max(1, n // 1000)
+        top_idx = np.argpartition(flat, -k)[-k:]
+        A = rgb_small_f.reshape(-1, 3)[top_idx].mean(axis=0)
+        A = np.maximum(A, 1.0)  # avoid div-by-zero on a pitch-black frame
+
+        # Transmission map at low res.
+        norm = rgb_small_f / A
+        dc_norm = np.min(norm, axis=2)
+        dc_norm = cv2.erode(dc_norm, self._defog_kernel)
+        t = (1.0 - self._defog_omega * dc_norm).astype(np.float32)
+
+        # Refine with guided filter (or bilateral if ximgproc is unavailable).
+        # Guide MUST be float [0, 1] — cv2.ximgproc.guidedFilter produces NaN
+        # when uint8 guide is paired with a sub-unit eps (eps is in guide units).
+        gray_small_f = (
+            cv2.cvtColor(rgb_small, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+        )
+        try:
+            t = cv2.ximgproc.guidedFilter(
+                guide=gray_small_f,
+                src=t,
+                radius=self._defog_gf_radius,
+                eps=self._defog_gf_eps,
+            )
+        except AttributeError:
+            t = cv2.bilateralFilter(t, 9, 0.1, 5)
+
+        t_full = cv2.resize(t, (w, h), interpolation=cv2.INTER_LINEAR)
+        t_full = np.clip(t_full, self._defog_t0, 1.0)[..., None]
+
+        # Recover J = (I - A) / max(t, t0) + A. nan_to_num guards the cast
+        # against pathological frames (all-black + degenerate A).
+        rgb_f = rgb.astype(np.float32)
+        J = (rgb_f - A) / t_full + A
+        J = np.nan_to_num(J, nan=128.0, posinf=255.0, neginf=0.0)
+        return np.clip(J, 0, 255).astype(np.uint8)
+
+    # ------------------------------------------------------------------ deblur
+    def _deblur_wiener(self, gray: np.ndarray) -> np.ndarray:
+        """Wiener deconvolution for the env's horizontal 1x3 box motion blur.
+
+        Fallback-only — Wiener on clean frames rings the marker's quiet-zone
+        border. Precomputed FFT of a centered kernel keeps this at ~2 ms.
+        """
+        # Pad/crop to the expected (480, 640) the precomputed kernel assumes.
+        if gray.shape != (480, 640):
+            return gray
+        G = np.fft.rfft2(gray.astype(np.float32))
+        K = self._wiener_K
+        H = np.conj(K) / (np.abs(K) ** 2 + self._wiener_nsr)
+        restored = np.fft.irfft2(G * H, s=gray.shape)
+        return np.clip(restored, 0, 255).astype(np.uint8)
+
+    # ------------------------------------------------------------------ CNN fallback
+    def _try_load_cnn(self) -> None:
+        """Lazy-load the corner-detector ONNX. Missing model => stay disabled
+        and let perceive() fall through cleanly. Warm-up forward primes
+        cv2.dnn's buffer allocation so the first real call is hot."""
+        model_path = Path(__file__).resolve().parent / "models" / "corner_detector.onnx"
+        if not model_path.exists():
+            return
+        try:
+            net = cv2.dnn.readNetFromONNX(str(model_path))
+            dummy = np.zeros((1, 1, 72, 96), dtype=np.float32)
+            net.setInput(dummy)
+            net.forward()
+            self._cnn_net = net
+            self._cnn_ready = True
+        except Exception as exc:  # noqa: BLE001 — non-fatal degradation
+            import sys
+            print(
+                f"[Agent] CNN load failed ({exc}); perception will fall through "
+                f"to detected=False on hard frames.",
+                file=sys.stderr,
+            )
+            self._cnn_net = None
+            self._cnn_ready = False
+
+    def _cnn_corners(self, rgb_full: np.ndarray) -> Optional[np.ndarray]:
+        """Predict marker corner pixels from a degraded frame. Returns a
+        (4, 2) float32 array in TL/TR/BR/BL order matching ArUco's convention,
+        or None when the visibility head says the marker is absent."""
+        if self._cnn_net is None:
+            return None
+        try:
+            gray = cv2.cvtColor(rgb_full, cv2.COLOR_RGB2GRAY)
+            inp = cv2.resize(gray, (96, 72), interpolation=cv2.INTER_AREA)
+            inp_f = (inp.astype(np.float32) / 255.0).reshape(1, 1, 72, 96)
+            self._cnn_net.setInput(inp_f)
+            out = self._cnn_net.forward().reshape(-1)
+            if out.size != 9 or not np.all(np.isfinite(out)):
+                return None
+            visible = float(out[8])
+            if visible < 0.5:
+                return None
+            corners_norm = out[:8].reshape(4, 2)
+            h, w = rgb_full.shape[:2]
+            corners_px = np.empty((4, 2), dtype=np.float32)
+            corners_px[:, 0] = corners_norm[:, 0] * float(w)
+            corners_px[:, 1] = corners_norm[:, 1] * float(h)
+            if not np.all(np.isfinite(corners_px)):
+                return None
+            return corners_px
+        except Exception:  # noqa: BLE001
+            return None
 
     # ------------------------------------------------------------------ estimation
     def estimate(self, perception: Dict, drone_state: Dict) -> Dict:
@@ -676,6 +921,12 @@ class BaselineAgent:
                 diff = _wrap_mod_pi(psi_meas - float(self._heading_kf.x[0]))
                 if abs(diff) > self.HEADING_FLIP_REJECT_RAD:
                     psi_meas = None
+
+        # CNN-source poses go through position update but not heading: a
+        # corner-regression rvec is noisier than detection-source rvec, and
+        # the heading filter is intentionally distrustful.
+        if psi_meas is not None and perception.get("source") == "cnn":
+            psi_meas = None
 
         if psi_meas is not None:
             # Drone tilt = angle between body z and world z.

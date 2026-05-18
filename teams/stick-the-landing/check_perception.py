@@ -29,7 +29,7 @@ from agents.agent_baseline import BaselineAgent     # noqa: E402
 from agent import Agent, marker_to_world            # noqa: E402
 
 
-SCENARIOS = ["easy", "medium", "hard"]
+SCENARIOS = ["easy", "medium", "hard", "recovery"]
 SEED = 1
 
 
@@ -44,12 +44,16 @@ def run_scenario(name: str, seed: int = SEED) -> dict:
 
         errs, yaw_errs = [], []
         n_steps = n_det = n_fresh = 0
+        src_counts = {"aruco": 0, "deconv": 0, "cnn": 0}
         done = False
         while not done:
             p = perc.perceive(obs["camera"])
             n_steps += 1
             if p["detected"]:
                 n_det += 1
+                src = p.get("source")
+                if src in src_counts:
+                    src_counts[src] += 1
                 if not p["stale"]:
                     n_fresh += 1
                     mw, myaw = marker_to_world(p, obs["state"])
@@ -66,6 +70,9 @@ def run_scenario(name: str, seed: int = SEED) -> dict:
             "steps": n_steps,
             "detect_rate": n_det / max(n_steps, 1),
             "fresh": n_fresh,
+            "src_aruco": src_counts["aruco"],
+            "src_deconv": src_counts["deconv"],
+            "src_cnn": src_counts["cnn"],
             "xy_rms_m": float(np.sqrt(np.mean(np.square(errs)))) if errs else float("nan"),
             "xy_p95_m": float(np.percentile(errs, 95)) if errs else float("nan"),
             "yaw_mean_deg": float(np.degrees(np.mean(yaw_errs))) if yaw_errs else float("nan"),
@@ -76,8 +83,9 @@ def run_scenario(name: str, seed: int = SEED) -> dict:
 
 def main() -> int:
     print(f"{'scenario':9s} {'steps':>6s} {'detect':>7s} {'fresh':>6s} "
+          f"{'aruco':>6s} {'deconv':>7s} {'cnn':>5s} "
           f"{'xy_rms':>9s} {'xy_p95':>9s} {'yaw_mean':>9s}")
-    print("-" * 62)
+    print("-" * 90)
     results = []
     for name in SCENARIOS:
         try:
@@ -88,7 +96,8 @@ def main() -> int:
             continue
         results.append(r)
         print(f"{r['scenario']:9s} {r['steps']:6d} {r['detect_rate']:6.2f} "
-              f"{r['fresh']:6d} {r['xy_rms_m']:8.3f}m {r['xy_p95_m']:8.3f}m "
+              f"{r['fresh']:6d} {r['src_aruco']:6d} {r['src_deconv']:7d} "
+              f"{r['src_cnn']:5d} {r['xy_rms_m']:8.3f}m {r['xy_p95_m']:8.3f}m "
               f"{r['yaw_mean_deg']:8.2f}d")
 
     print()

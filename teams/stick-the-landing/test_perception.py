@@ -4,8 +4,8 @@ Run inside Docker, from the repo root:
     ./docker/run-local.sh pytest teams/stick-the-landing/test_perception.py -v
 
 Synthetic tests (no PyBullet env): detection, pose recovery, the camera->world
-transform, and the stale-frame flag. End-to-end accuracy against ground truth
-is covered by check_perception.py.
+transform, the stale-frame flag, and the defog/deconv/CNN cascade tiers.
+End-to-end accuracy against ground truth is covered by check_perception.py.
 """
 
 import os
@@ -21,7 +21,12 @@ for _p in (REPO_ROOT, HERE):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from boat_landing.camera import get_intrinsics                            # noqa: E402
+from boat_landing.camera import (                                         # noqa: E402
+    apply_fog,
+    apply_motion_blur,
+    apply_noise,
+    get_intrinsics,
+)
 from agent import Agent, MARKER_SIZE_M, marker_to_world, rpy_to_matrix    # noqa: E402
 
 
@@ -57,11 +62,11 @@ def test_perceive_blank_frame_reports_no_detection():
 def test_perceive_detects_synthetic_marker():
     out = Agent().perceive(_synthetic_frame(marker_px=240))
     assert out["detected"] is True
-    assert out["reproj_error"] < 2.0          # fronto-parallel -> tiny error
+    assert out["reprojection_error"] < 2.0    # fronto-parallel -> tiny error
     assert out["tvec"].shape == (3,)
     assert out["rvec"].shape == (3,)
     assert out["image_points"].shape == (4, 2)
-    assert out["marker_px"] > 0.0
+    assert out["source"] == "aruco"           # clean frame should hit the fast path
 
 
 def test_perceive_depth_matches_pinhole_geometry():
@@ -69,7 +74,16 @@ def test_perceive_depth_matches_pinhole_geometry():
     out = Agent().perceive(_synthetic_frame(marker_px=240))
     assert out["detected"] is True
     fx = get_intrinsics()[0, 0]
-    expected_depth = fx * MARKER_SIZE_M / out["marker_px"]
+    # Reconstruct the marker's observed pixel size from image_points (the
+    # live perception contract no longer exposes a separate `marker_px`).
+    ip = out["image_points"]
+    side_px = float(np.mean([
+        np.linalg.norm(ip[0] - ip[1]),
+        np.linalg.norm(ip[1] - ip[2]),
+        np.linalg.norm(ip[2] - ip[3]),
+        np.linalg.norm(ip[3] - ip[0]),
+    ]))
+    expected_depth = fx * MARKER_SIZE_M / side_px
     assert abs(out["tvec"][2] - expected_depth) / expected_depth < 0.15
     # centred marker -> pose essentially on the optical axis
     assert abs(out["tvec"][0]) < 0.1 * out["tvec"][2]
@@ -90,6 +104,104 @@ def test_distinct_frames_are_not_stale():
     agent.perceive(_synthetic_frame(marker_px=240))
     out = agent.perceive(_synthetic_frame(marker_px=200))
     assert out["stale"] is False
+
+
+# ---------------------------------------------------------------- cascade tiers
+
+def test_cascade_defog_helps_on_fogged_frame():
+    """Heavy Beer-Lambert fog washes contrast out. Dark-channel defog
+    composed with CLAHE should recover the marker on the first ArUco pass."""
+    frame = apply_fog(_synthetic_frame(marker_px=240), fog_density=0.10, altitude_m=5.0)
+    out = Agent().perceive(frame)
+    assert out["detected"] is True
+    assert out["source"] == "aruco"   # defog (always-on) keeps us on the fast tier
+
+
+def test_cascade_deconv_recovers_blurred_frame():
+    """Horizontal motion blur breaks ArUco's grid decoding even when polygons
+    are still visible. Wiener deconvolution fallback should re-decode."""
+    frame = apply_motion_blur(_synthetic_frame(marker_px=240), kernel_size=3)
+    out = Agent().perceive(frame)
+    assert out["detected"] is True
+    assert out["source"] == "deconv"  # ArUco missed; Wiener path recovered
+
+
+def test_cascade_skips_wiener_when_no_polygon_candidates():
+    """Without polygon candidates (n_rejected == 0) the Wiener retry must
+    NOT run — its second adaptive-threshold scan would burn ~50 ms for
+    nothing. Spy on _deblur_wiener and assert it isn't called."""
+    agent = Agent()
+    calls = {"wiener": 0}
+    real_wiener = agent._deblur_wiener
+    def spy(gray):
+        calls["wiener"] += 1
+        return real_wiener(gray)
+    agent._deblur_wiener = spy  # type: ignore[assignment]
+
+    rng = np.random.default_rng(0)
+    flat = np.full((480, 640, 3), 180, np.uint8)
+    fresh = np.clip(
+        flat.astype(np.int16) + rng.integers(-3, 3, flat.shape), 0, 255
+    ).astype(np.uint8)
+    out = agent.perceive(fresh)
+    assert out["detected"] is False
+    assert calls["wiener"] == 0, "Wiener ran on a featureless frame (no candidates)"
+
+
+def test_cascade_runs_wiener_when_polygon_candidates_present():
+    """Blur-only marker frame: ArUco's first pass should see polygons
+    (n_rejected > 0) but fail to decode marker 0; Wiener fallback then runs."""
+    agent = Agent()
+    calls = {"wiener": 0}
+    real_wiener = agent._deblur_wiener
+    def spy(gray):
+        calls["wiener"] += 1
+        return real_wiener(gray)
+    agent._deblur_wiener = spy  # type: ignore[assignment]
+
+    frame = apply_motion_blur(_synthetic_frame(marker_px=240), kernel_size=3)
+    out = agent.perceive(frame)
+    assert out["detected"] is True
+    assert out["source"] == "deconv"
+    assert calls["wiener"] == 1, "Wiener should have run exactly once on the fallback path"
+
+
+def test_cascade_cnn_missing_does_not_raise():
+    """When models/corner_detector.onnx is absent the CNN fallback must
+    cleanly stay disabled and perceive() returns detected=False without
+    raising on a frame ArUco cannot solve."""
+    agent = Agent()
+    # If the model file is committed in CI, this assertion is moot; otherwise
+    # _cnn_ready should be False.
+    if agent._cnn_ready:
+        pytest.skip("corner_detector.onnx is present — CNN path active")
+    bad = apply_noise(
+        apply_motion_blur(
+            apply_fog(_synthetic_frame(marker_px=240), 0.10, 5.0),
+            5,
+        ),
+        0.06,
+        np.random.default_rng(0),
+    )
+    out = agent.perceive(bad)
+    # Either detected (defog+deconv recovered) or cleanly not detected;
+    # the contract is just that no exception is raised and stale is set.
+    assert "detected" in out and "stale" in out
+
+
+def test_stale_short_circuit_returns_cached_detection():
+    """Identical consecutive frames should return the cached perception dict
+    with stale=True — avoids re-running defog/ArUco on byte-identical
+    repeats (the cost driver on camera-fps-throttled scenarios)."""
+    agent = Agent()
+    frame = _synthetic_frame(240)
+    first = agent.perceive(frame)
+    second = agent.perceive(frame.copy())  # byte-identical -> stale
+    assert second["stale"] is True
+    # The cached dict carries the same detection result.
+    assert second["detected"] == first["detected"]
+    if first["detected"]:
+        assert np.allclose(second["tvec"], first["tvec"])
 
 
 # ----------------------------------------------------------- rpy_to_matrix()
