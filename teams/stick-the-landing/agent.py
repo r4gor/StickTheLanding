@@ -571,9 +571,13 @@ class BaselineAgent:
         out of the bonus."""
         if self._last_estimate is None or self._last_estimate.get("position") is None:
             return None
+        pos = self._last_estimate["position"]
+        vel = self._last_estimate.get("velocity")
+        if vel is None:
+            vel = np.zeros(3)
         return {
-            "position": np.asarray(self._last_estimate["position"]),
-            "velocity": np.asarray(self._last_estimate.get("velocity", np.zeros(3))),
+            "position": np.asarray(pos, dtype=np.float64),
+            "velocity": np.asarray(vel, dtype=np.float64),
         }
 
     # ------------------------------------------------------------------ STAGE 1: PERCEPTION
@@ -1268,22 +1272,62 @@ class BaselineAgent:
     # ------------------------------------------------------------------ decision
     def decide(
         self, drone_state: Dict, boat_estimate: Dict, battery: float, time_s: float
-    ) -> str:
+    ) -> Dict:
+        """Returns the contracts.md phase_out dict. Includes commit_soft
+        (relaxed gating: close-and-low), yaw_locked (heading available),
+        target_descent_rate (per-phase), yaw_target (boat heading)."""
         pos = np.asarray(drone_state["position"], dtype=np.float64)
         target = boat_estimate.get("position")
+
+        def _make(phase, commit_soft=False, yaw_locked=False, target_descent_rate=0.0, yaw_target=None, abort_reason=None):
+            return {
+                "phase": phase,
+                "commit_soft": bool(commit_soft),
+                "yaw_locked": bool(yaw_locked),
+                "target_descent_rate": float(target_descent_rate),
+                "yaw_target": yaw_target,
+                "abort_reason": abort_reason,
+            }
+
         if target is None or boat_estimate.get("from_prior", False):
-            return PHASE_SEARCH
+            return _make(PHASE_SEARCH, abort_reason="no_target_or_from_prior")
 
         horiz = float(np.linalg.norm(pos[:2] - np.asarray(target[:2])))
         z_above = float(pos[2] - target[2])
+        boat_heading = boat_estimate.get("heading")
+        yaw_locked = boat_heading is not None
 
+        # Phase FSM (unchanged thresholds)
         if z_above < self.DESCEND_ALTITUDE_OK:
-            return PHASE_LAND
-        if horiz < self.DESCEND_HORIZ_OK and z_above < self.APPROACH_ALTITUDE_OK:
-            return PHASE_DESCEND
-        if horiz < self.APPROACH_HORIZ_OK:
-            return PHASE_APPROACH
-        return PHASE_APPROACH if boat_estimate.get("fresh", False) else PHASE_SEARCH
+            phase = PHASE_LAND
+        elif horiz < self.DESCEND_HORIZ_OK and z_above < self.APPROACH_ALTITUDE_OK:
+            phase = PHASE_DESCEND
+        elif horiz < self.APPROACH_HORIZ_OK:
+            phase = PHASE_APPROACH
+        elif boat_estimate.get("fresh", False):
+            phase = PHASE_APPROACH
+        else:
+            phase = PHASE_SEARCH
+
+        # Relaxed commit_soft gate: close in xy + close in altitude.
+        # (Strict 4-of-4 v_rel/tracked gate per decide.md is chicken-and-egg —
+        # v_rel_vert can't drop until soft profile fires.)
+        commit_soft = (horiz < 0.3 and z_above < 1.5)
+
+        if phase == PHASE_LAND:
+            target_descent_rate = 0.25 if commit_soft else 0.5
+        elif phase == PHASE_DESCEND:
+            target_descent_rate = 0.6
+        else:
+            target_descent_rate = 0.0
+
+        return _make(
+            phase,
+            commit_soft=commit_soft,
+            yaw_locked=yaw_locked,
+            target_descent_rate=target_descent_rate,
+            yaw_target=boat_heading,
+        )
 
     # ------------------------------------------------------------------ control
     @staticmethod
