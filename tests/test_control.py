@@ -464,17 +464,23 @@ def test_anti_windup_still_integrates_when_unsaturated():
     assert pid._i < 1.0
 
 
-def test_anti_windup_releases_on_sign_flip():
-    """When error sign flips back, integrator should start moving again."""
+def test_anti_windup_releases_when_unsaturated():
+    """When the unclipped command leaves saturation, integration resumes.
+
+    Conditional integration locks the integrator only while the unclipped
+    command exceeds the actuator limit IN THE SAME DIRECTION as the error.
+    Drop the error magnitude (or sign-flip + drop) and integration restarts.
+    """
     pid = stl.PID(kp=10.0, ki=1.0, kd=0.0, out_min=-1.0, out_max=1.0, i_clip=10.0)
-    # Saturate positive for many steps
+    # Step 1: saturate hard, integrator stays low
     for _ in range(20):
         pid(err=5.0, dt=0.1)
-    i_at_saturation = pid._i
-    # Now flip error sign — integration should resume in the opposite direction
+    i_after_sat = pid._i
+    # Step 2: small error in opposite direction — unclipped command -0.5 is
+    # WITHIN limits, anti-windup releases, integrator moves down.
     for _ in range(5):
-        pid(err=-5.0, dt=0.1)
-    assert pid._i < i_at_saturation, "integrator did not release on sign flip"
+        pid(err=-0.05, dt=0.1)
+    assert pid._i < i_after_sat, "integrator did not release when unsaturated"
 
 
 # ------------------------------------------------------------------ baseline preservation
