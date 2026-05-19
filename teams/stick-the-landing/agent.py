@@ -1183,6 +1183,15 @@ class BaselineAgent:
         # Defensive fallback — unknown shape means we have no phase info.
         return PHASE_SEARCH
 
+    # --- Velocity feedforward (control.md item #2; 30-50% lateral RMS cut) ---
+    # Cheap PD-style FF: the predicted body-frame velocity to track the boat
+    # is added on top of the position PID as a small pitch/roll bias.
+    # Reading the boat-velocity KF estimate when present, defaulting to zero
+    # otherwise (baseline behavior preserved when KF is uninitialised).
+    VEL_FF_GAIN_APPROACH = 0.15
+    VEL_FF_GAIN_LAND = 0.7 * 0.15   # 0.105 — softer near touchdown
+    POS_TO_VEL_GAIN = 0.5           # position-error → desired velocity gain
+
     # --- Soft-landing tunables (control.md item #4, scorer +5) ---
     SOFT_LAND_V_MAX = 0.6           # m/s — peak descent rate at altitude
     SOFT_LAND_H_TAU = 0.5           # m   — exponential profile time-constant
@@ -1299,6 +1308,29 @@ class BaselineAgent:
         pitch_cmd = self.pid_x(err_body[0], self.DT, measurement_velocity=vel_body[0])
         roll_cmd = -self.pid_y(err_body[1], self.DT, measurement_velocity=vel_body[1])
         thrust_cmd = self.pid_z(err_world[2], self.DT, measurement_velocity=vel_world[2])
+
+        # --- Velocity feedforward (control.md item #2) ---
+        # Build a body-frame desired-velocity vector from the position error
+        # and the KF boat-velocity estimate, then bias pitch/roll toward it.
+        # Sign mapping matches the PID terms: +body_x → +pitch, +body_y → −roll.
+        # Defaults preserve baseline when KF velocity is missing/non-finite.
+        target_v_world_raw = boat_estimate.get("velocity")
+        target_v_world = np.zeros(3, dtype=np.float64)
+        if target_v_world_raw is not None:
+            try:
+                _tv = np.asarray(target_v_world_raw, dtype=np.float64).reshape(3)
+                if np.all(np.isfinite(_tv)):
+                    target_v_world = _tv
+            except (TypeError, ValueError):
+                pass
+        v_des_world = err_world * self.POS_TO_VEL_GAIN + target_v_world
+        v_des_body = R.T @ v_des_world
+        ff_gain = (
+            self.VEL_FF_GAIN_LAND if phase == PHASE_LAND
+            else self.VEL_FF_GAIN_APPROACH
+        )
+        pitch_cmd = float(np.clip(pitch_cmd + ff_gain * float(v_des_body[0]), -1.0, 1.0))
+        roll_cmd  = float(np.clip(roll_cmd  - ff_gain * float(v_des_body[1]), -1.0, 1.0))
         # In LAND, force thrust to the controller's lower bound (50% hover
         # thrust). The z-PID alone outputs ~ -0.10 at this altitude — over
         # the platform the reference sim's ground-effect amplification cancels

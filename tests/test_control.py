@@ -233,6 +233,76 @@ def test_land_phase_uses_soft_profile_with_commit_soft():
     assert np.isfinite(sp["thrust"])
 
 
+# ------------------------------------------------------------------ velocity feedforward (item #3)
+def test_velocity_ff_uses_kf_estimate():
+    """FF should bias pitch in the direction of estimated boat motion.
+
+    With drone XY at the same point as the boat position estimate, the only
+    forcing on pitch comes from FF — a +x boat velocity must increase pitch
+    relative to the zero-velocity baseline.
+    """
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    base_estimate = {
+        "position": np.array([5.0, 0.0, 0.0]),  # same XY as drone
+        "velocity": np.zeros(3),
+        "fresh": True,
+        "stale_steps": 0,
+        "from_prior": False,
+    }
+    moving_estimate = dict(base_estimate)
+    moving_estimate["velocity"] = np.array([2.0, 0.0, 0.0])  # boat moving +x
+
+    sp_base = agent._control_setpoints(obs["state"], base_estimate, stl.PHASE_APPROACH)
+    # Reset PIDs so the comparison isn't biased by integrator state.
+    agent.pid_x.reset(); agent.pid_y.reset(); agent.pid_z.reset()
+    agent._prev_phase = None
+    sp_moving = agent._control_setpoints(obs["state"], moving_estimate, stl.PHASE_APPROACH)
+
+    assert sp_moving["pitch"] > sp_base["pitch"], (
+        f"pitch did not increase with +x boat velocity: "
+        f"base={sp_base['pitch']:.4f}, moving={sp_moving['pitch']:.4f}"
+    )
+
+
+def test_velocity_ff_handles_missing_velocity():
+    """Missing 'velocity' key in boat_estimate must default to zero, not crash."""
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    estimate = {
+        "position": np.array([5.0, 0.0, 0.0]),
+        "fresh": True,
+        "stale_steps": 0,
+        "from_prior": False,
+    }
+    sp = agent._control_setpoints(obs["state"], estimate, stl.PHASE_APPROACH)
+    for v in sp.values():
+        assert np.isfinite(v)
+
+
+def test_velocity_ff_handles_nan_velocity():
+    """NaN/Inf in boat_estimate.velocity must fall back to zero defaults."""
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    estimate = {
+        "position": np.array([5.0, 0.0, 0.0]),
+        "velocity": np.array([float("nan"), float("inf"), 0.0]),
+        "fresh": True,
+        "stale_steps": 0,
+        "from_prior": False,
+    }
+    sp = agent._control_setpoints(obs["state"], estimate, stl.PHASE_APPROACH)
+    for v in sp.values():
+        assert np.isfinite(v)
+
+
+def test_velocity_ff_gain_lower_in_land():
+    """LAND phase uses 0.7x FF gain — gentler near touchdown."""
+    agent = stl.BaselineAgent()
+    assert agent.VEL_FF_GAIN_LAND < agent.VEL_FF_GAIN_APPROACH
+    assert abs(agent.VEL_FF_GAIN_LAND - 0.7 * agent.VEL_FF_GAIN_APPROACH) < 1e-9
+
+
 # ------------------------------------------------------------------ baseline preservation
 def test_act_still_works_after_refactor():
     """The act() entrypoint must remain functional — baseline preservation."""
