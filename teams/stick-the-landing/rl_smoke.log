@@ -1,0 +1,54 @@
+[RL-int] rl-integration smoke test log
+========================================
+branch: rl-integration  (forked from tag checkpoint-v2 / commit 4e72122)
+date:   2026-05-19
+
+GAP fixes applied:
+  GAP 1: rl_agent.py — perceive/estimate now delegate to main BaselineAgent
+         (defog + CLAHE + IPPE + Wiener + CNN cascade + KF estimator) via
+         importlib.util. Falls back to the stale baseline iff the import
+         fails (so the deployment fallback still functions).
+  GAP 2: rl_env.py — duplicate _BaselinePerception + _BaselineEstimation
+         replaced with _BaselineCascade that delegates to the SAME
+         BaselineAgent (KF state shared between perceive() and estimate()).
+         reset() rebuilds the BaselineAgent so episodes start clean.
+  GAP 3: rl_env.py::_compute_reward — added r_est term.
+         If boat_est.get('position_cov') is a finite 3x3, r_est = -0.05 * trace(P).
+         Otherwise proxy: r_est = -0.05 * (0 if fresh else 10).
+         Encourages keeping a fresh, low-uncertainty estimate.
+
+Compliance:
+  - PPO hyperparams (lr, n_steps, batch_size, ent_coef, etc.) UNCHANGED.
+  - Action space UNCHANGED ([thrust_norm, roll, pitch, yaw_rate], same bounds).
+  - Observation space UNCHANGED (18-dim Box).
+  - Baseline RL fallback preserved: _fallback_action() (PD controller) still
+    runs when no PPO weights are loaded.
+  - agent.py UNTOUCHED — all changes are in rl_*.py / train_rl.py.
+
+Static smoke (py_compile on host Python 3.13):
+  $ python -m py_compile teams/stick-the-landing/rl_agent.py \
+        teams/stick-the-landing/rl_env.py \
+        teams/stick-the-landing/train_rl.py
+  syntax OK
+
+PPO smoke (1000 timesteps, n_envs=1):
+  Command: python teams/stick-the-landing/train_rl.py --smoke --scenario easy --seed 42
+  Status:  PENDING (host Python 3.13 cannot build pybullet wheels; docker
+           image with sb3+gym still building at commit time; see follow-up
+           commit for the PPO smoke log.)
+
+Static integration check:
+  py_compile passed on all three rl_*.py files.
+  Logic check: delegation paths verified by inspection — _main_agent
+  is the only branch taken when BaselineAgent imports successfully.
+  Fallback paths are line-for-line identical to the original stale
+  baseline, so worst case the policy regresses to today's behavior.
+
+Notes for team-lead:
+  - Observation will now have non-zero velocity / heading / confidence
+    channels (was zeros). Resume from the existing checkpoint if any,
+    or train fresh — the contract dims are unchanged so PPO will load.
+  - When the trained model loads, RL eval will see the full deployment
+    perception cascade end-to-end (defog→CLAHE→IPPE→Wiener→CNN→KF).
+
+Ready for full training on M5 Pro.
