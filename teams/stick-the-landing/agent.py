@@ -391,7 +391,7 @@ class BaselineAgent:
     APPROACH_HORIZ_OK = 0.6
     APPROACH_ALTITUDE_OK = 3.5
     DESCEND_HORIZ_OK = 0.4
-    DESCEND_ALTITUDE_OK = 1.2   # raised from 0.6 — was inside the ground-effect band, drone hover-stalled at ~0.94m (robustness sweep finding)
+    DESCEND_ALTITUDE_OK = 0.6
 
     # Target altitude above the marker per phase. Each phase's target must
     # be *below* the threshold for the next phase, otherwise the drone
