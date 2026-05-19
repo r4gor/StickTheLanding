@@ -1110,6 +1110,54 @@ class BaselineAgent:
         # Defensive fallback — unknown shape means we have no phase info.
         return PHASE_SEARCH
 
+    # --- Soft-landing tunables (control.md item #4, scorer +5) ---
+    SOFT_LAND_V_MAX = 0.6           # m/s — peak descent rate at altitude
+    SOFT_LAND_H_TAU = 0.5           # m   — exponential profile time-constant
+    SOFT_LAND_CRAWL_H = 0.10        # m   — switch to terminal crawl below this
+    SOFT_LAND_CRAWL_VZ = -0.15      # m/s — terminal-crawl target
+    SOFT_LAND_KP_VZ = 1.2           # P gain on vz error → normalized thrust
+    SOFT_LAND_THRUST_FLOOR = -0.7   # min thrust — never command full free-fall
+
+    def _soft_land_thrust(
+        self,
+        z_above: float,
+        vz_world: float,
+        target_descent_rate: Optional[float] = None,
+    ) -> float:
+        """Exponential soft-landing thrust law.
+
+        ``vz_target = -v_max * (1 - exp(-h / tau))`` ramps from 0 m/s at the
+        deck up to ``-v_max`` at altitude, with terminal-crawl override
+        below ``SOFT_LAND_CRAWL_H``. A P loop on ``(vz_target - vz_world)``
+        produces normalised thrust; floored at ``SOFT_LAND_THRUST_FLOOR`` so
+        the controller never commands literal free-fall.
+
+        Stays strictly below the scorer's ``< 1.0 m/s`` threshold for the
+        +5 soft-landing bonus across the realistic LAND-phase altitude band
+        (h ∈ [0, ~0.6] m given DESCEND_ALTITUDE_OK = 0.6).
+
+        ``target_descent_rate`` (optional, from ``phase_out``) lets
+        ``decide()`` cap the peak descent rate without coupling this
+        controller to its policy.
+        """
+        v_max = self.SOFT_LAND_V_MAX
+        if target_descent_rate is not None:
+            try:
+                tdr = float(target_descent_rate)
+                if np.isfinite(tdr) and tdr > 0.0:
+                    v_max = min(v_max, tdr)
+            except (TypeError, ValueError):
+                pass
+
+        h = max(float(z_above), 0.0)
+        vz_target = -v_max * (1.0 - np.exp(-h / max(self.SOFT_LAND_H_TAU, 1e-6)))
+        if h < self.SOFT_LAND_CRAWL_H:
+            vz_target = self.SOFT_LAND_CRAWL_VZ
+        err_vz = vz_target - float(vz_world)
+        thrust_raw = self.SOFT_LAND_KP_VZ * err_vz
+        thrust_clipped = float(np.clip(thrust_raw, -1.0, 1.0))
+        return max(thrust_clipped, self.SOFT_LAND_THRUST_FLOOR)
+
     def _control_setpoints(
         self, drone_state: Dict, boat_estimate: Dict, phase_out,
     ) -> Dict[str, float]:
@@ -1188,8 +1236,27 @@ class BaselineAgent:
         # max_descent_velocity often saturates, killing the soft-landing
         # bonus. Smooth descent profiles + velocity feed-forward are left
         # as exercises.
+        # LAND-phase thrust:
+        # - Default (legacy bang-bang): full negative thrust pushes through
+        #   the ground-effect cushion and the drone touches down, but with
+        #   max_descent_velocity saturated — forfeits the soft-landing bonus.
+        # - Soft profile (control.md #4 + contracts.md): exponential vz
+        #   target tracked with a P loop, floored at -0.7, opt-in via
+        #   phase_out.commit_soft. Scorer caps the +5 bonus at vz < 1.0 m/s.
         if phase == PHASE_LAND:
-            thrust_cmd = -1.0
+            commit_soft = False
+            target_descent_rate = None
+            if isinstance(phase_out, dict):
+                commit_soft = bool(phase_out.get("commit_soft", False))
+                target_descent_rate = phase_out.get("target_descent_rate")
+            if commit_soft:
+                thrust_cmd = self._soft_land_thrust(
+                    z_above=float(pos[2] - target[2]),
+                    vz_world=float(vel_world[2]),
+                    target_descent_rate=target_descent_rate,
+                )
+            else:
+                thrust_cmd = -1.0
         yaw_rate_cmd = 0.0
 
         # NaN/Inf guard. Per contracts.md the four setpoints MUST be finite

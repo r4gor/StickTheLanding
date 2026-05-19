@@ -139,6 +139,100 @@ def test_act_setpoint_survives_blank_frame():
             assert np.isfinite(v)
 
 
+# ------------------------------------------------------------------ soft-landing (item #2)
+def test_soft_land_profile_below_descent_threshold():
+    """Soft-landing vz profile must stay strictly below the 1.0 m/s scorer cap.
+
+    The +5 soft-landing bonus only triggers when max_descent_velocity < 1.0;
+    SOFT_LAND_V_MAX = 0.6 with strict margin even at infinite altitude.
+    """
+    agent = stl.BaselineAgent()
+    for h in (0.0, 0.05, 0.10, 0.20, 0.50, 1.0, 5.0):
+        v_max = agent.SOFT_LAND_V_MAX
+        tau = agent.SOFT_LAND_H_TAU
+        if h < agent.SOFT_LAND_CRAWL_H:
+            vz_target = agent.SOFT_LAND_CRAWL_VZ
+        else:
+            vz_target = -v_max * (1.0 - np.exp(-h / tau))
+        assert abs(vz_target) < 1.0, f"vz_target {vz_target} >= 1.0 at h={h}"
+
+
+def test_soft_land_thrust_floored():
+    """Thrust must never drop below SOFT_LAND_THRUST_FLOOR (no free-fall)."""
+    agent = stl.BaselineAgent()
+    # Massive positive vz error (drone rocketing up) would push thrust to -1
+    # without the floor; verify it clamps.
+    t = agent._soft_land_thrust(z_above=0.5, vz_world=10.0)
+    assert t >= agent.SOFT_LAND_THRUST_FLOOR
+    assert np.isfinite(t)
+
+
+def test_soft_land_thrust_finite_at_zero_altitude():
+    """Edge case: h=0 means vz_target = crawl; thrust must be finite."""
+    agent = stl.BaselineAgent()
+    t = agent._soft_land_thrust(z_above=0.0, vz_world=-0.1)
+    assert np.isfinite(t)
+
+
+def test_soft_land_thrust_respects_target_descent_rate():
+    """phase_out.target_descent_rate should clamp v_max smaller."""
+    agent = stl.BaselineAgent()
+    # tdr=0.3 caps v_max to 0.3. At z=5m, vz_target ≈ -0.3. If drone is
+    # already at -0.3, P loop produces ~0 thrust correction (well above floor).
+    t = agent._soft_land_thrust(
+        z_above=5.0, vz_world=-0.3, target_descent_rate=0.3,
+    )
+    assert t > agent.SOFT_LAND_THRUST_FLOOR
+    assert np.isfinite(t)
+
+
+def test_soft_land_thrust_handles_nan_target_descent_rate():
+    """NaN/garbage target_descent_rate falls back to SOFT_LAND_V_MAX gracefully."""
+    agent = stl.BaselineAgent()
+    t = agent._soft_land_thrust(
+        z_above=0.5, vz_world=0.0, target_descent_rate=float("nan"),
+    )
+    assert np.isfinite(t)
+    t2 = agent._soft_land_thrust(
+        z_above=0.5, vz_world=0.0, target_descent_rate="not a number",
+    )
+    assert np.isfinite(t2)
+
+
+def test_land_phase_uses_bang_bang_without_commit_soft():
+    """Without phase_out.commit_soft, LAND falls back to legacy bang-bang -1.0."""
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    perception = agent.perceive(obs["camera"])
+    boat_estimate = agent.estimate(perception, obs["state"])
+    # String phase_out (baseline) — no commit_soft possible.
+    sp = agent._control_setpoints(obs["state"], boat_estimate, stl.PHASE_LAND)
+    assert sp["thrust"] == -1.0
+    # Dict phase_out with commit_soft=False (or absent) — same fallback.
+    sp2 = agent._control_setpoints(
+        obs["state"], boat_estimate, {"phase": stl.PHASE_LAND},
+    )
+    assert sp2["thrust"] == -1.0
+
+
+def test_land_phase_uses_soft_profile_with_commit_soft():
+    """With commit_soft=True, LAND uses soft profile — thrust >= floor and != -1.0."""
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    # Put drone close to ground, hovering — soft profile should engage.
+    obs["state"]["position"] = np.array([0.0, 0.0, 0.5])
+    obs["state"]["velocity"] = np.zeros(3)
+    perception = agent.perceive(obs["camera"])
+    boat_estimate = agent.estimate(perception, obs["state"])
+    sp = agent._control_setpoints(
+        obs["state"], boat_estimate,
+        {"phase": stl.PHASE_LAND, "commit_soft": True},
+    )
+    assert sp["thrust"] >= agent.SOFT_LAND_THRUST_FLOOR
+    assert sp["thrust"] != -1.0  # not legacy bang-bang
+    assert np.isfinite(sp["thrust"])
+
+
 # ------------------------------------------------------------------ baseline preservation
 def test_act_still_works_after_refactor():
     """The act() entrypoint must remain functional — baseline preservation."""
