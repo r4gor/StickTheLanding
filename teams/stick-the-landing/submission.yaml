@@ -33,7 +33,24 @@ simulator_features:
 # score:
 #   T2.C code quality of the simulator (0/3/5)
 notes: |
-  Describe here:
-    * any aerodynamics / motor / battery models beyond Tier 1 baselines
-    * what the sim handles that the test suite does not check
-    * known limitations
+  Beyond the Tier-1 baselines the battery model uses a linear SOC-dependent
+  OCV curve (V_oc = V_nom * (0.80 + 0.40 * SOC)) with a pack-level internal
+  resistance of 0.20 Ω (cell + harness/ESC/BEC parasitics; spec value of
+  0.025 Ω is cell-only and produces only ~2% sag at full throttle). An ESC
+  efficiency factor η_esc = 0.80 scales the mechanical-to-electrical current
+  estimate. The ω_max ceiling formulation — rather than multiplicative
+  throttle scaling — preserves hover trim: at low throttle the battery has
+  headroom and the motor tracks the request exactly; saturation only occurs
+  when V_term can no longer push more current through R_int. The ground-effect
+  amplifier computes each motor's world-z height by projecting motor body
+  positions through the current rotation matrix, so the per-motor h is correct
+  even when the drone is tilted. Quaternion integration uses the closed-form
+  axis-angle formulation (exact for constant ω over the substep).
+
+  The sim tracks SOC depletion via a running energy integral (E_rem in Wh)
+  and feeds V_term back into the next substep's current estimate — the
+  full electrical feedback loop is live at every 5 ms substep. Known
+  limitations: the integrator is semi-implicit Euler (not RK4); rotor
+  gyroscopic torque on the body and motor rotor inertia (rotor_inertia from
+  the spec) are not modelled; no VTOL tilt-servo dynamics or hover/cruise
+  transition logic.
