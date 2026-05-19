@@ -321,17 +321,32 @@ class PID:
         dt: float,
         measurement_velocity: Optional[float] = None,
     ) -> float:
-        self._i = float(np.clip(self._i + err * dt, -self.i_clip, self.i_clip))
+        # D-term first so the anti-windup decision below sees the full
+        # pre-integration command. measurement_velocity (D-on-measurement)
+        # is preferred — d(err)/dt spikes when the noisy boat estimate
+        # snaps to a new detection.
         if measurement_velocity is not None:
-            # err = setpoint - measurement, so d(err)/dt = -d(meas)/dt.
             d = -float(measurement_velocity)
         elif self._prev_err is None:
             d = 0.0
         else:
             d = (err - self._prev_err) / max(dt, 1e-6)
         self._prev_err = err
-        out = self.kp * err + self.ki * self._i + self.kd * d
-        return float(np.clip(out, self.out_min, self.out_max))
+
+        # Conditional-integration anti-windup (control.md item #7): refuse
+        # to integrate further into saturation when the unclipped command
+        # is already pushed past the actuator limit IN THE SAME DIRECTION
+        # as the current error. Standard clamp-on-saturate form.
+        out_unclipped = self.kp * err + self.ki * self._i + self.kd * d
+        out = float(np.clip(out_unclipped, self.out_min, self.out_max))
+        sat_limit = max(abs(self.out_max), abs(self.out_min))
+        saturated_against_err = (
+            abs(out_unclipped) > sat_limit
+            and (out_unclipped >= 0.0) == (err >= 0.0)
+        )
+        if not saturated_against_err:
+            self._i = float(np.clip(self._i + err * dt, -self.i_clip, self.i_clip))
+        return out
 
 
 class BaselineAgent:
@@ -1183,6 +1198,14 @@ class BaselineAgent:
         # Defensive fallback — unknown shape means we have no phase info.
         return PHASE_SEARCH
 
+    # --- Tilt compensation (control.md item #6) ---
+    # Standard altitude-control correction: when the drone is banking to
+    # chase a lateral target, the body-z thrust contribution to world-z
+    # collapses by cos(roll)*cos(pitch). Boosting the commanded thrust
+    # by 1/tilt_factor maintains altitude under aggressive lateral tracking.
+    # Floor at 0.5 (== ~60deg tilt) so we never multiply by a runaway number.
+    TILT_COMP_FLOOR = 0.5
+
     # --- Active yaw control (control.md item #5) ---
     # Mod-pi error against the heading KF estimate. Gated on
     # phase_out.yaw_locked so decide() can hold the freeze until the
@@ -1320,6 +1343,15 @@ class BaselineAgent:
         pitch_cmd = self.pid_x(err_body[0], self.DT, measurement_velocity=vel_body[0])
         roll_cmd = -self.pid_y(err_body[1], self.DT, measurement_velocity=vel_body[1])
         thrust_cmd = self.pid_z(err_world[2], self.DT, measurement_velocity=vel_world[2])
+        # Tilt compensation: divide commanded thrust by cos(roll)*cos(pitch)
+        # so altitude does not sag when the drone is banking laterally.
+        roll_att_for_tilt = float(drone_state["attitude"][0])
+        pitch_att_for_tilt = float(drone_state["attitude"][1])
+        tilt_factor = max(
+            float(np.cos(roll_att_for_tilt) * np.cos(pitch_att_for_tilt)),
+            self.TILT_COMP_FLOOR,
+        )
+        thrust_cmd = float(thrust_cmd) / tilt_factor
 
         # --- Velocity feedforward (control.md item #2) ---
         # Build a body-frame desired-velocity vector from the position error

@@ -402,6 +402,81 @@ def test_yaw_nan_safe():
     assert np.isfinite(sp["yaw_rate"])
 
 
+
+# ------------------------------------------------------------------ tilt comp + anti-windup (item #5)
+def test_tilt_comp_constant_present():
+    """TILT_COMP_FLOOR class constant must exist (floor on 1/tilt_factor)."""
+    agent = stl.BaselineAgent()
+    assert hasattr(agent, "TILT_COMP_FLOOR")
+    assert 0.0 < agent.TILT_COMP_FLOOR <= 1.0
+
+
+def test_tilt_comp_boosts_thrust_under_bank():
+    """Thrust command should be larger (less negative) when the drone is banked.
+
+    Banking the drone reduces vertical thrust component by cos(roll)*cos(pitch);
+    tilt comp compensates by scaling the commanded thrust accordingly.
+    """
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    # Drone hovers at target altitude (use a moderate altitude target).
+    obs["state"]["position"] = np.array([0.0, 0.0, 3.0])
+    est = {
+        "position": np.array([0.0, 0.0, 0.0]),  # marker at 0,0,0
+        "velocity": np.zeros(3),
+        "fresh": True,
+        "stale_steps": 0,
+        "from_prior": False,
+    }
+    # No tilt
+    obs["state"]["attitude"] = np.array([0.0, 0.0, 0.0])
+    sp_flat = agent._control_setpoints(obs["state"], est, stl.PHASE_APPROACH)
+    # Reset PIDs
+    agent.pid_x.reset(); agent.pid_y.reset(); agent.pid_z.reset()
+    agent._prev_phase = None
+    # 30 degree roll
+    obs["state"]["attitude"] = np.array([np.deg2rad(30.0), 0.0, 0.0])
+    sp_bank = agent._control_setpoints(obs["state"], est, stl.PHASE_APPROACH)
+    # Banking should produce a thrust command with larger magnitude (boosted)
+    assert abs(sp_bank["thrust"]) >= abs(sp_flat["thrust"]) - 1e-6
+
+
+def test_anti_windup_stops_integrator_when_saturated():
+    """Integrator must not grow when the controller is already saturated
+    in the same direction as the error."""
+    pid = stl.PID(kp=10.0, ki=1.0, kd=0.0, out_min=-1.0, out_max=1.0, i_clip=10.0)
+    # Drive with large positive error so the controller saturates at +1.
+    for _ in range(20):
+        out = pid(err=5.0, dt=0.1)
+        assert out == 1.0
+    # Integrator should be small (not 5.0 * 0.1 * 20 = 10.0 worst case)
+    # because anti-windup stops integration during saturation.
+    assert pid._i < 1.0, f"integrator wound up despite saturation: {pid._i}"
+
+
+def test_anti_windup_still_integrates_when_unsaturated():
+    """Integrator should still accumulate when output is not saturated."""
+    pid = stl.PID(kp=0.0, ki=1.0, kd=0.0, out_min=-1.0, out_max=1.0, i_clip=10.0)
+    for _ in range(5):
+        pid(err=0.1, dt=0.1)
+    # 5 * 0.1 * 0.1 = 0.05 — well within unsaturated region.
+    assert pid._i > 0.04
+    assert pid._i < 1.0
+
+
+def test_anti_windup_releases_on_sign_flip():
+    """When error sign flips back, integrator should start moving again."""
+    pid = stl.PID(kp=10.0, ki=1.0, kd=0.0, out_min=-1.0, out_max=1.0, i_clip=10.0)
+    # Saturate positive for many steps
+    for _ in range(20):
+        pid(err=5.0, dt=0.1)
+    i_at_saturation = pid._i
+    # Now flip error sign — integration should resume in the opposite direction
+    for _ in range(5):
+        pid(err=-5.0, dt=0.1)
+    assert pid._i < i_at_saturation, "integrator did not release on sign flip"
+
+
 # ------------------------------------------------------------------ baseline preservation
 def test_act_still_works_after_refactor():
     """The act() entrypoint must remain functional — baseline preservation."""
