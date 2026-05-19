@@ -47,7 +47,13 @@ fi
 # --network host: gives the container the host's network so participants
 # who pull artifacts from the internet during dev don't hit DNS issues.
 # Drop it if your eval policy forbids network at scoring time.
-exec docker run --rm -it \
+# `-t` requires a TTY; auto-detect so this script also works under non-TTY
+# automation (CI, agent harnesses) without breaking interactive shells.
+DOCKER_FLAGS="-i"
+if [ -t 0 ] && [ -t 1 ]; then
+    DOCKER_FLAGS="-it"
+fi
+exec docker run --rm $DOCKER_FLAGS \
     $PLATFORM_FLAG \
     --cpus="$CPUS" \
     --memory="$MEMORY" \
