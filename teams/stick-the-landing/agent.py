@@ -15,6 +15,7 @@ baseline-quality 3-PID + threshold state machine from agent_template.py and
 are next on the critical path (see teams/stick-the-landing/notes/control.md).
 """
 
+import os
 import time
 from pathlib import Path
 from typing import Dict, Optional
@@ -460,6 +461,30 @@ class BaselineAgent:
         self._defog_gf_radius = 15
         self._defog_gf_eps = 1e-3
         self._defog_kernel = np.ones((7, 7), dtype=np.uint8)
+        # Fog gate: dark-channel defog is the dominant perceive() cost on
+        # clean frames (EASY scenario: 0 fog → 6-10 ms wasted per call).
+        # A truly-foggy frame raises the minimum pixel value across all
+        # channels (Beer-Lambert blends towards atmospheric light, so dark
+        # pixels lose brightness contrast). If a 1/64-subsample finds any
+        # genuinely dark pixel, skip defog entirely — it'd be a near-identity
+        # transform anyway since dark_channel ≈ 0 implies transmission ≈ 1.
+        self._defog_skip_thresh = 30
+
+        # Stage-timing instrumentation. Off by default (cheap; ~100 ns per
+        # time.perf_counter() call, ~2 µs total per perceive()). Enable
+        # via AGENT_TIMING=1 to print rolling mean-ms-per-stage every
+        # _TIMING_PRINT_EVERY perceive() calls — useful for profiling but
+        # noisy enough that we don't want it on the scored run.
+        self._timing_enabled = bool(os.environ.get("AGENT_TIMING"))
+        self._TIMING_PRINT_EVERY = 50
+        self._timing_stage_us: Dict[str, float] = {
+            "hash": 0.0, "defog_skip_test": 0.0, "defog_run": 0.0,
+            "gray_clahe": 0.0, "aruco": 0.0, "solvepnp_aruco": 0.0,
+            "wiener": 0.0, "aruco2": 0.0, "cnn": 0.0, "total": 0.0,
+        }
+        self._timing_run_counts: Dict[str, int] = {
+            "perceive": 0, "defog_run": 0, "wiener": 0, "cnn": 0,
+        }
 
         # Wiener deconvolution kernel for horizontal 1x3 box motion blur,
         # the worst case the env applies (camera.apply_motion_blur).
@@ -579,6 +604,7 @@ class BaselineAgent:
         including "no detection". Filtering is estimate()'s job.
         """
         t0 = time.perf_counter()
+        tlog = self._timing_enabled
 
         # Stale-frame detection: when the scenario fps < 50 the env repeats
         # the previous frame. Hashing the raw bytes lets estimate() skip a
@@ -587,6 +613,9 @@ class BaselineAgent:
         frame_hash = hash(camera_image.tobytes())
         stale = frame_hash == self._last_frame_hash
         self._last_frame_hash = frame_hash
+        if tlog:
+            tA = time.perf_counter()
+            self._timing_stage_us["hash"] += (tA - t0) * 1e6
 
         # Stale short-circuit: re-running defog + ArUco on a byte-identical
         # frame produces the same answer at full cost. Return the cached dict
@@ -595,21 +624,48 @@ class BaselineAgent:
         if stale and self._last_perception is not None:
             cached = dict(self._last_perception)
             cached["stale"] = True
+            if tlog:
+                self._record_perceive_timing(t0)
             return cached
 
-        # A: Always-on dark-channel defog before CLAHE.
+        # A: Defog (fog-gated). On a clean frame the gate returns rgb
+        # unchanged in ~50 µs; on a foggy frame this is the 3-5 ms path.
+        if tlog:
+            tB = time.perf_counter()
         rgb_defogged = self._defog_dark_channel(camera_image)
+        if tlog:
+            tC = time.perf_counter()
+            # Split skip-test from real-work: the gate's cost is the elapsed
+            # if the output IS the input (id-equal); otherwise it's the full
+            # defog path.
+            if rgb_defogged is camera_image:
+                self._timing_stage_us["defog_skip_test"] += (tC - tB) * 1e6
+            else:
+                self._timing_stage_us["defog_run"] += (tC - tB) * 1e6
+                self._timing_run_counts["defog_run"] += 1
+
         gray = cv2.cvtColor(rgb_defogged, cv2.COLOR_RGB2GRAY)
         # CLAHE restores marker contrast under the Beer-Lambert fog blend.
         gray = self._clahe.apply(gray)
+        if tlog:
+            tD = time.perf_counter()
+            self._timing_stage_us["gray_clahe"] += (tD - tC) * 1e6
 
         image_points, n_rejected = self._aruco_detect(gray)
+        if tlog:
+            tE = time.perf_counter()
+            self._timing_stage_us["aruco"] += (tE - tD) * 1e6
         if image_points is not None:
             result = self._solve_pose_from_corners(
                 image_points, stale, source="aruco"
             )
+            if tlog:
+                tF = time.perf_counter()
+                self._timing_stage_us["solvepnp_aruco"] += (tF - tE) * 1e6
             if result["detected"]:
                 self._last_perception = result
+                if tlog:
+                    self._record_perceive_timing(t0)
                 return result
 
         # B: Wiener deconv fallback — only when ArUco saw quad candidates
@@ -618,28 +674,66 @@ class BaselineAgent:
         # latency-gated: on heavy noise the first ArUco pass alone burns
         # the budget; a second pass would push perceive() above 100 ms.
         if n_rejected > 0 and (time.perf_counter() - t0) < 0.012:
+            if tlog:
+                tG = time.perf_counter()
+                self._timing_run_counts["wiener"] += 1
             gray_dbl = self._deblur_wiener(gray)
             result = self._aruco_and_pose(gray_dbl, stale, source="deconv")
+            if tlog:
+                tH = time.perf_counter()
+                self._timing_stage_us["wiener"] += (tH - tG) * 1e6
             if result["detected"]:
                 self._last_perception = result
+                if tlog:
+                    self._record_perceive_timing(t0)
                 return result
 
         # C: CNN corner regressor — latency-gated. Runs even when n_rejected
         # is 0 because the CNN can pick up the marker from low-level features
         # ArUco's polygon-first pipeline misses (e.g. heavy fog + small marker).
         if self._cnn_ready and (time.perf_counter() - t0) < 0.015:
+            if tlog:
+                tI = time.perf_counter()
+                self._timing_run_counts["cnn"] += 1
             pred_corners = self._cnn_corners(camera_image)
             if pred_corners is not None:
                 result = self._solve_pose_from_corners(
                     pred_corners, stale, source="cnn"
                 )
+                if tlog:
+                    self._timing_stage_us["cnn"] += (time.perf_counter() - tI) * 1e6
                 if result["detected"]:
                     self._last_perception = result
+                    if tlog:
+                        self._record_perceive_timing(t0)
                     return result
+            elif tlog:
+                self._timing_stage_us["cnn"] += (time.perf_counter() - tI) * 1e6
 
         miss = {"detected": False, "stale": stale}
         self._last_perception = miss
+        if tlog:
+            self._record_perceive_timing(t0)
         return miss
+
+    def _record_perceive_timing(self, t0: float) -> None:
+        """Accumulate total perceive() time and emit a TIMING line every
+        _TIMING_PRINT_EVERY calls. Mean-µs-per-call is reported per stage,
+        with run-count denominators for the optional stages."""
+        self._timing_stage_us["total"] += (time.perf_counter() - t0) * 1e6
+        self._timing_run_counts["perceive"] += 1
+        n = self._timing_run_counts["perceive"]
+        if n % self._TIMING_PRINT_EVERY:
+            return
+        import sys
+        # Per-stage average over all perceives (i.e., amortized cost,
+        # including the 0-cost stages on stale/short-circuit calls).
+        parts = [f"n={n}"]
+        for k, v in self._timing_stage_us.items():
+            parts.append(f"{k}={v / n:.1f}us")
+        for k in ("defog_run", "wiener", "cnn"):
+            parts.append(f"{k}_count={self._timing_run_counts[k]}")
+        print("TIMING " + " ".join(parts), file=sys.stderr)
 
     # ------------------------------------------------------------------ cascade helpers
     def _aruco_detect(self, gray: np.ndarray):
@@ -747,9 +841,18 @@ class BaselineAgent:
 
         Compute the dark-channel transmission map at 1/4 resolution, refine
         with a guided filter, upsample, then invert the haze blend
-        `I = t * J + (1 - t) * A` for `J`. Always-on so contrast restoration
-        compounds with CLAHE downstream. Targets ~3-5 ms on the eval CPU.
+        `I = t * J + (1 - t) * A` for `J`. Targets ~3-5 ms on the eval CPU.
+
+        Fog gate: on truly clean frames the dark-channel is ~0 everywhere,
+        the transmission map is ~1 everywhere, and the algorithm reduces
+        to J ≈ I — an expensive identity. Probe a sub-sampled minimum
+        first and short-circuit when at least one pixel is genuinely dark.
         """
+        # Fog-presence probe — 1/64 subsample, ~0.05 ms on uint8. A single
+        # genuinely-dark pixel under any channel is sufficient evidence that
+        # the frame isn't washed out by haze.
+        if rgb[::8, ::8].min() < self._defog_skip_thresh:
+            return rgb
         h, w = rgb.shape[:2]
         qw = max(1, w // self._defog_scale)
         qh = max(1, h // self._defog_scale)
