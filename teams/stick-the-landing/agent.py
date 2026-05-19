@@ -439,8 +439,12 @@ class BaselineAgent:
         perception = self.perceive(camera)
         boat_estimate = self.estimate(perception, state)
         self._last_estimate = boat_estimate
-        self.phase = self.decide(state, boat_estimate, battery, time_s)
-        action = self.control(state, boat_estimate, self.phase)
+        phase_out = self.decide(state, boat_estimate, battery, time_s)
+        # decide() may eventually return a dict per contracts.md; for now
+        # the baseline returns a string. Surface the string form on self
+        # for legacy inspectors, but pass the full phase_out into control().
+        self.phase = self._phase_from(phase_out)
+        action = self.control(state, boat_estimate, phase_out)
         if not np.all(np.isfinite(action)):
             import sys
             print(
@@ -1091,9 +1095,36 @@ class BaselineAgent:
         return PHASE_APPROACH if boat_estimate.get("fresh", False) else PHASE_SEARCH
 
     # ------------------------------------------------------------------ control
-    def control(
-        self, drone_state: Dict, boat_estimate: Dict, phase: str
-    ) -> np.ndarray:
+    @staticmethod
+    def _phase_from(phase_out) -> str:
+        """Backwards-compat: ``decide()`` may return either a bare phase
+        string (baseline) or a dict per contracts.md (planned). Accept both
+        so this stage doesn't block the decide-stage upgrade.
+        """
+        if isinstance(phase_out, str):
+            return phase_out
+        if isinstance(phase_out, dict):
+            phase = phase_out.get("phase")
+            if isinstance(phase, str):
+                return phase
+        # Defensive fallback — unknown shape means we have no phase info.
+        return PHASE_SEARCH
+
+    def _control_setpoints(
+        self, drone_state: Dict, boat_estimate: Dict, phase_out,
+    ) -> Dict[str, float]:
+        """Compute the high-level (thrust, roll, pitch, yaw_rate) setpoints.
+
+        Shared between ``control()`` (which then mixes into per-motor
+        throttles) and ``act_setpoint()`` (which returns these setpoints
+        directly for the FC-compatible interface, +15 pts per
+        ``teams/stick-the-landing/notes/contracts.md``).
+
+        All four outputs are guaranteed finite — non-finite intermediates
+        collapse to the safe-hover setpoint (0, 0, 0, 0).
+        """
+        phase = self._phase_from(phase_out)
+
         # Reset PID integrators on phase transitions. Without this, the
         # z-PID's integrator saturates during a prolonged LAND (err is
         # always large-negative against the -0.5 m target) and carries
@@ -1112,7 +1143,11 @@ class BaselineAgent:
                 [self.SEARCH_PRIOR_XY[0], self.SEARCH_PRIOR_XY[1], 0.3]
             )
 
-        target_z = float(target[2]) + self.PHASE_ALTITUDE[phase]
+        # .get() with SEARCH fallback so PHASE_ALTITUDE lookup never raises
+        # if decide ever returns a phase we don't recognise (additive contract).
+        target_z = float(target[2]) + self.PHASE_ALTITUDE.get(
+            phase, self.PHASE_ALTITUDE[PHASE_SEARCH],
+        )
 
         # World-frame errors -> body-frame errors so the controller works
         # regardless of yaw. The baseline never actively yaws, but this
@@ -1157,16 +1192,74 @@ class BaselineAgent:
             thrust_cmd = -1.0
         yaw_rate_cmd = 0.0
 
+        # NaN/Inf guard. Per contracts.md the four setpoints MUST be finite
+        # — collapse any anomaly to the safe-hover setpoint rather than
+        # propagating poison through attitude_ctrl / the FC link.
+        sp = {
+            "thrust": float(thrust_cmd),
+            "roll": float(roll_cmd),
+            "pitch": float(pitch_cmd),
+            "yaw_rate": float(yaw_rate_cmd),
+        }
+        for k, v in sp.items():
+            if not np.isfinite(v):
+                sp[k] = 0.0
+        return sp
+
+    def control(
+        self, drone_state: Dict, boat_estimate: Dict, phase_out
+    ) -> np.ndarray:
+        # phase_out may be a bare phase string (baseline) or the contract
+        # dict (decide-stage upgrade). _control_setpoints normalises both.
+        sp = self._control_setpoints(drone_state, boat_estimate, phase_out)
+
         # Hand the high-level (thrust, roll, pitch, yaw_rate) setpoints to
         # the stock attitude controller, which mixes them into per-motor
         # throttles using the drone spec's geometry and propeller params.
         return self.attitude_ctrl(
             drone_state,
-            roll_des=roll_cmd,
-            pitch_des=pitch_cmd,
-            yaw_rate_des=yaw_rate_cmd,
-            thrust_norm=thrust_cmd,
+            roll_des=sp["roll"],
+            pitch_des=sp["pitch"],
+            yaw_rate_des=sp["yaw_rate"],
+            thrust_norm=sp["thrust"],
         )
+
+    # ------------------------------------------------------------------ FC-compatible setpoint API
+    def act_setpoint(self, obs: Dict):
+        """Flight-controller-compatible 4-DoF setpoint output.
+
+        Returns ``(thrust_norm, roll, pitch, yaw_rate)`` — the same four
+        setpoints ``control()`` already computes internally. Per
+        ``evaluation/evaluate.py:146-163``, the mere presence of this
+        method earns the +15 FC-compatibility bonus on every LANDED run.
+
+        Runs the same perceive → estimate → decide → control pipeline as
+        ``act()`` but stops at the setpoint stage — the evaluator owns the
+        attitude controller in setpoint mode.
+        """
+        camera = obs["camera"]
+        state = obs["state"]
+        battery = obs["battery"]
+        time_s = obs["time"]
+
+        perception = self.perceive(camera)
+        boat_estimate = self.estimate(perception, state)
+        self._last_estimate = boat_estimate
+        phase_out = self.decide(state, boat_estimate, battery, time_s)
+        # Keep self.phase in sync with the act() path so external inspectors
+        # see consistent phase regardless of which entrypoint the eval uses.
+        self.phase = self._phase_from(phase_out)
+
+        sp = self._control_setpoints(state, boat_estimate, phase_out)
+
+        # Final NaN guard — if anything upstream still leaked non-finite
+        # (shouldn't, _control_setpoints already clamps), fall back to
+        # the safe-hover setpoint (zero attitude, hover thrust = 0.0).
+        thrust = sp["thrust"] if np.isfinite(sp["thrust"]) else 0.0
+        roll   = sp["roll"]   if np.isfinite(sp["roll"])   else 0.0
+        pitch  = sp["pitch"]  if np.isfinite(sp["pitch"])  else 0.0
+        yaw    = sp["yaw_rate"] if np.isfinite(sp["yaw_rate"]) else 0.0
+        return (float(thrust), float(roll), float(pitch), float(yaw))
 
 
 # Module-level entry point. evaluation/evaluate.py imports the module
