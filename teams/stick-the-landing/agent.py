@@ -96,54 +96,110 @@ def _wrap_mod_pi(angle: float) -> float:
 
 
 class _BoatKalmanFilter:
-    """Linear 4-state Kalman filter on world-frame ``[x, y, vx, vy]``.
+    """5-state coordinated-turn EKF on world-frame ``[x, y, vx, vy, omega]``.
 
-    Constant-velocity (CV) process model with white-noise acceleration
-    process noise (``sigma_a`` m/s^2 1-sigma per axis). Matches PX4's
-    landing_target_estimator design and the team's estimate.md playbook.
-    A single conservative ``sigma_a = 2.0`` covers EASY/MEDIUM/HARD —
-    HARD's curve at 1.8 m/s with r=30 m has centripetal accel ~0.11 m/s^2,
-    well inside the absorption band.
+    The boat in HARD follows a constant-radius curve (r=30 m at 1.8 m/s,
+    omega = v/r ~ 0.06 rad/s). A pure constant-velocity (CV) filter
+    absorbs the 0.11 m/s² centripetal accel into Q but is biased during
+    sustained turns — fine for the est-bonus RMSE, painful during a
+    long blackout (predict-only drifts off the arc). Adding omega to the
+    state lets the filter predict the curve forward correctly.
+
+    Dynamics (continuous):
+        x_dot   = vx
+        y_dot   = vy
+        vx_dot  = -vy * omega         # rotate velocity vector
+        vy_dot  =  vx * omega
+        omega_dot = 0                  # nearly-constant-turn model
+
+    With dt=0.02 s and |omega·dt| ~ 0.0012 rad on HARD, the small-angle
+    EKF Jacobian is plenty accurate (the higher-order Taylor terms are
+    ~5e-7 per step). When the boat is straight (omega → 0 with Q-pull),
+    the EKF reduces to the CV filter to machine precision — preserves
+    the test_kf_estimator regression suite.
+
+    ``sigma_a`` is the white-noise-acceleration std on (vx, vy) [m/s^2];
+    ``sigma_omegadot`` is the same on omega [rad/s^2]. A boat doesn't
+    change turn rate fast — sigma_omegadot=0.05 lets omega track the
+    HARD curve in <2 s while staying near 0 on EASY (where the boat is
+    static).
     """
 
-    H = np.array([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], dtype=np.float64)
+    # 2x5 measurement matrix — z = [x_meas, y_meas]; vx, vy, omega are
+    # observed only through their effect on position over time.
+    H = np.array(
+        [[1.0, 0.0, 0.0, 0.0, 0.0],
+         [0.0, 1.0, 0.0, 0.0, 0.0]],
+        dtype=np.float64,
+    )
 
-    def __init__(self, sigma_a: float = 2.0) -> None:
-        self.x = np.zeros(4, dtype=np.float64)
-        self.P = np.eye(4, dtype=np.float64) * 1.0e6  # huge prior — uninitialised
+    def __init__(
+        self, sigma_a: float = 2.0, sigma_omegadot: float = 0.05,
+    ) -> None:
+        self.x = np.zeros(5, dtype=np.float64)
+        self.P = np.eye(5, dtype=np.float64) * 1.0e6  # huge prior — uninitialised
         self.initialized = False
         self.sigma_a = float(sigma_a)
+        self.sigma_omegadot = float(sigma_omegadot)
 
-    @staticmethod
-    def _F(dt: float) -> np.ndarray:
+    def _F(self, dt: float) -> np.ndarray:
+        """Discrete-time linearised state-transition Jacobian, evaluated at
+        the current state. Closed-form Taylor expansion is exact through
+        first order in dt; on this problem |omega·dt| << 1 makes the
+        truncation negligible."""
+        vx = float(self.x[2])
+        vy = float(self.x[3])
+        omega = float(self.x[4])
         return np.array(
-            [[1.0, 0.0, dt, 0.0],
-             [0.0, 1.0, 0.0, dt],
-             [0.0, 0.0, 1.0, 0.0],
-             [0.0, 0.0, 0.0, 1.0]],
+            [[1.0, 0.0, dt,         0.0,        0.0],
+             [0.0, 1.0, 0.0,        dt,         0.0],
+             [0.0, 0.0, 1.0,        -omega * dt, -vy * dt],
+             [0.0, 0.0, omega * dt,  1.0,        vx * dt],
+             [0.0, 0.0, 0.0,        0.0,        1.0]],
             dtype=np.float64,
         )
 
     def _Q(self, dt: float) -> np.ndarray:
+        """White-noise process noise: WNA on (vx, vy) (preserves the CV
+        block 1:1 when omega=0) plus an independent WNA on omega.
+        Cross-terms are zero — the angular and linear accelerations of
+        the boat are physically uncorrelated to first order."""
         s = self.sigma_a ** 2
-        return s * np.array(
-            [[dt**4 / 4.0, 0.0,         dt**3 / 2.0, 0.0],
-             [0.0,         dt**4 / 4.0, 0.0,         dt**3 / 2.0],
-             [dt**3 / 2.0, 0.0,         dt**2,       0.0],
-             [0.0,         dt**3 / 2.0, 0.0,         dt**2]],
-            dtype=np.float64,
-        )
+        so = self.sigma_omegadot ** 2
+        Q = np.zeros((5, 5), dtype=np.float64)
+        Q[0, 0] = s * dt**4 / 4.0
+        Q[1, 1] = s * dt**4 / 4.0
+        Q[0, 2] = s * dt**3 / 2.0
+        Q[2, 0] = s * dt**3 / 2.0
+        Q[1, 3] = s * dt**3 / 2.0
+        Q[3, 1] = s * dt**3 / 2.0
+        Q[2, 2] = s * dt**2
+        Q[3, 3] = s * dt**2
+        Q[4, 4] = so * dt
+        return Q
 
     def predict(self, dt: float) -> None:
         if not self.initialized:
             return
+        # Nonlinear state propagation (forward Euler is sufficient at
+        # dt=0.02; the EKF's first-order Jacobian assumes Euler too).
+        x_prev, y_prev = self.x[0], self.x[1]
+        vx_prev, vy_prev = self.x[2], self.x[3]
+        omega = self.x[4]
+        self.x = np.array(
+            [x_prev + vx_prev * dt,
+             y_prev + vy_prev * dt,
+             vx_prev - vy_prev * omega * dt,
+             vy_prev + vx_prev * omega * dt,
+             omega],
+            dtype=np.float64,
+        )
         F = self._F(dt)
-        self.x = F @ self.x
         self.P = F @ self.P @ F.T + self._Q(dt)
 
     def innovation(self, z: np.ndarray, R: np.ndarray):
         """Return ``(innov, S)`` for outlier gating before committing."""
-        innov = z - self.H @ self.x
+        innov = np.asarray(z, dtype=np.float64) - self.H @ self.x
         S = self.H @ self.P @ self.H.T + R
         return innov, S
 
@@ -155,11 +211,20 @@ class _BoatKalmanFilter:
             return
         K = self.P @ self.H.T @ S_inv
         self.x = self.x + K @ innov
-        self.P = (np.eye(4) - K @ self.H) @ self.P
+        self.P = (np.eye(5) - K @ self.H) @ self.P
 
     def initialize(self, z: np.ndarray, sigma_xy: float) -> None:
-        self.x = np.array([float(z[0]), float(z[1]), 0.0, 0.0], dtype=np.float64)
-        self.P = np.diag([sigma_xy ** 2, sigma_xy ** 2, 1.0, 1.0]).astype(np.float64)
+        # Seed omega=0 with a moderately confident prior (sigma_omega
+        # ~ 0.1 rad/s). Too confident and a HARD curve takes seconds to
+        # detect; too loose and EASY's static boat picks up phantom turn
+        # rate from measurement noise. 0.1 rad/s splits the difference.
+        sigma_omega_init = 0.1
+        self.x = np.array(
+            [float(z[0]), float(z[1]), 0.0, 0.0, 0.0], dtype=np.float64,
+        )
+        self.P = np.diag(
+            [sigma_xy ** 2, sigma_xy ** 2, 1.0, 1.0, sigma_omega_init ** 2]
+        ).astype(np.float64)
         self.initialized = True
 
 
@@ -274,11 +339,14 @@ class BaselineAgent:
 
     DT = 0.02  # must match BoatLandingEnv.DT
 
-    # Position-KF outlier gating. 13.8 = chi^2 99.9% with 2 DoF — the team
-    # raised this above the textbook 9.21 (99%) because gated NIS is not
-    # exactly chi^2 distributed under heavy occlusion (estimate.md cites
-    # arXiv 2512.18508). Five consecutive rejects trip a reinit-from-latest.
-    NIS_THRESHOLD = 13.8
+    # Position-KF outlier gating. 9.0 ≈ chi^2 99% with 2 DoF — Mahalanobis
+    # distance ≈ 3 in 2D-equivalent terms ("3σ rejection"). Tightened from
+    # the previous 13.8 (99.9%) because on HARD a single fog/blur frame
+    # can produce a catastrophically bad PnP solution; we'd rather drop
+    # the detection than yank a converged track sideways. Five consecutive
+    # rejects still trip a reinit-from-latest so the filter recovers from
+    # sustained measurement shifts (e.g. after a long blackout).
+    NIS_THRESHOLD = 9.0
     NIS_REINIT_AFTER = 5
 
     # Trust thresholds. The position filter is "trusted" (`fresh=True`)
@@ -968,11 +1036,16 @@ class BaselineAgent:
                 if self._last_marker_world is not None
                 else self._kf.x[:2]
             )
+            # Reset to a 5-D zero-velocity / zero-turn-rate prior with a
+            # wide cov on position and looser priors on velocity/omega so
+            # the filter can re-acquire when the marker comes back.
             self._kf.x = np.array(
-                [float(anchor[0]), float(anchor[1]), 0.0, 0.0],
+                [float(anchor[0]), float(anchor[1]), 0.0, 0.0, 0.0],
                 dtype=np.float64,
             )
-            self._kf.P = np.diag([4.0, 4.0, 1.0, 1.0]).astype(np.float64)
+            self._kf.P = np.diag(
+                [4.0, 4.0, 1.0, 1.0, 0.1 ** 2]
+            ).astype(np.float64)
             self._kf_trusted = False
             self._kf_consecutive_good = 0
             from_prior_now = True

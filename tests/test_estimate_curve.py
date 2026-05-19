@@ -96,10 +96,6 @@ def _make_drone_state(position, velocity=(0.0, 0.0, 0.0), attitude=(0.0, 0.0, 0.
 # --------------------------------------------------------------------------- #
 # Test 1: 3σ-deviant detection is rejected by outlier gate.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    reason="Phase 2: tighten outlier gate so single 3σ-deviant detection is dropped.",
-    strict=False,
-)
 def test_outlier_rejection_drops_three_sigma_deviant(team_agent_module):
     """Converge the filter on a stationary boat with very low measurement
     noise, then inject ONE detection offset by ~10σ. The KF must reject
@@ -156,10 +152,6 @@ def test_outlier_rejection_drops_three_sigma_deviant(team_agent_module):
 # --------------------------------------------------------------------------- #
 # Test 2: turning-rate filter beats CV on HARD's curved trajectory.
 # --------------------------------------------------------------------------- #
-@pytest.mark.xfail(
-    reason="Phase 2: extend KF state to [x, y, vx, vy, omega] (coordinated-turn).",
-    strict=False,
-)
 def test_turning_rate_filter_predicts_curve_better_than_cv(team_agent_module):
     """Simulate the HARD scenario boat: speed 1.8 m/s on a circle of
     radius 30 m (omega = v/r = 0.06 rad/s). Run the filter through 4 s
