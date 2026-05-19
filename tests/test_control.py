@@ -303,6 +303,105 @@ def test_velocity_ff_gain_lower_in_land():
     assert abs(agent.VEL_FF_GAIN_LAND - 0.7 * agent.VEL_FF_GAIN_APPROACH) < 1e-9
 
 
+
+# ------------------------------------------------------------------ active yaw (item #4)
+def _approach_estimate(boat_heading=None):
+    est = {
+        "position": np.array([5.0, 0.0, 0.0]),
+        "velocity": np.zeros(3),
+        "fresh": True,
+        "stale_steps": 0,
+        "from_prior": False,
+    }
+    if boat_heading is not None:
+        est["heading"] = boat_heading
+    return est
+
+
+def test_yaw_rate_zero_without_yaw_locked():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=1.0)
+    sp = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH},
+    )
+    assert sp["yaw_rate"] == 0.0
+
+
+def test_yaw_rate_zero_without_heading():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=None)
+    sp = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH, "yaw_locked": True},
+    )
+    assert sp["yaw_rate"] == 0.0
+
+
+def test_yaw_rate_zero_inside_deadband():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=np.deg2rad(5.0))
+    sp = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH, "yaw_locked": True},
+    )
+    assert sp["yaw_rate"] == 0.0
+
+
+def test_yaw_rate_active_outside_deadband():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=np.deg2rad(30.0))
+    sp = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH, "yaw_locked": True},
+    )
+    assert sp["yaw_rate"] > 0.0
+    assert np.isfinite(sp["yaw_rate"])
+    assert abs(sp["yaw_rate"]) <= agent.YAW_RATE_MAX_APPROACH + 1e-9
+
+
+def test_yaw_rate_limited_more_in_land():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=np.deg2rad(60.0))
+    obs["state"]["position"] = np.array([0.0, 0.0, 0.4])
+    sp_land = agent._control_setpoints(
+        obs["state"], est,
+        {"phase": stl.PHASE_LAND, "yaw_locked": True, "commit_soft": False},
+    )
+    agent.pid_x.reset(); agent.pid_y.reset(); agent.pid_z.reset()
+    agent._prev_phase = None
+    obs["state"]["position"] = np.array([5.0, 0.0, 5.0])
+    sp_app = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH, "yaw_locked": True},
+    )
+    assert abs(sp_land["yaw_rate"]) <= agent.YAW_RATE_MAX_LAND + 1e-9
+    assert abs(sp_app["yaw_rate"]) <= agent.YAW_RATE_MAX_APPROACH + 1e-9
+
+
+def test_yaw_uses_target_override():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=0.0)
+    sp = agent._control_setpoints(
+        obs["state"], est,
+        {"phase": stl.PHASE_APPROACH, "yaw_locked": True,
+         "yaw_target": np.deg2rad(30.0)},
+    )
+    assert sp["yaw_rate"] > 0.0
+
+
+def test_yaw_nan_safe():
+    agent = stl.BaselineAgent()
+    obs = _synthetic_obs()
+    est = _approach_estimate(boat_heading=float("nan"))
+    sp = agent._control_setpoints(
+        obs["state"], est, {"phase": stl.PHASE_APPROACH, "yaw_locked": True},
+    )
+    assert sp["yaw_rate"] == 0.0
+    assert np.isfinite(sp["yaw_rate"])
+
+
 # ------------------------------------------------------------------ baseline preservation
 def test_act_still_works_after_refactor():
     """The act() entrypoint must remain functional — baseline preservation."""

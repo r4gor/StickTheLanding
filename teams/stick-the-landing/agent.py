@@ -1183,6 +1183,18 @@ class BaselineAgent:
         # Defensive fallback — unknown shape means we have no phase info.
         return PHASE_SEARCH
 
+    # --- Active yaw control (control.md item #5) ---
+    # Mod-pi error against the heading KF estimate. Gated on
+    # phase_out.yaw_locked so decide() can hold the freeze until the
+    # estimate is stable. Deadband + gain-scheduled + rate-limited by
+    # phase - VTOL has weak yaw (k_Q/k_T = 0.020, high Izz, ~2s settle),
+    # so we start yawing in APPROACH instead of waiting for touchdown.
+    YAW_DEADBAND_RAD      = float(np.deg2rad(8.0))
+    YAW_KP_APPROACH       = 1.0
+    YAW_KP_DESCEND        = 0.5
+    YAW_RATE_MAX_APPROACH = 1.5     # rad/s - comfortable yaw slew at altitude
+    YAW_RATE_MAX_LAND     = 0.4     # rad/s - gentle near touchdown
+
     # --- Velocity feedforward (control.md item #2; 30-50% lateral RMS cut) ---
     # Cheap PD-style FF: the predicted body-frame velocity to track the boat
     # is added on top of the position PID as a small pitch/roll bias.
@@ -1362,7 +1374,46 @@ class BaselineAgent:
                 )
             else:
                 thrust_cmd = -1.0
+
+        # --- Active yaw control (control.md item #5) ---
+        # Baseline: yaw_rate_cmd = 0 (no active yaw). Opt-in path: when
+        # decide() signals yaw_locked AND we have a heading estimate,
+        # compute a mod-pi yaw error and command a P-controlled, rate-
+        # limited yaw rate. Mod-pi because the landing condition is
+        # fuselage-aligned-mod-pi (both 0 and pi pass).
         yaw_rate_cmd = 0.0
+        yaw_locked = False
+        yaw_target_override = None
+        if isinstance(phase_out, dict):
+            yaw_locked = bool(phase_out.get("yaw_locked", False))
+            yaw_target_override = phase_out.get("yaw_target")
+        boat_heading = boat_estimate.get("heading")
+        if yaw_locked and boat_heading is not None:
+            try:
+                boat_yaw_f = float(boat_heading)
+            except (TypeError, ValueError):
+                boat_yaw_f = float("nan")
+            if np.isfinite(boat_yaw_f):
+                target_yaw = boat_yaw_f
+                if yaw_target_override is not None:
+                    try:
+                        ty = float(yaw_target_override)
+                        if np.isfinite(ty):
+                            target_yaw = ty
+                    except (TypeError, ValueError):
+                        pass
+                drone_yaw = float(drone_state["attitude"][2])
+                yaw_err = _wrap_mod_pi(target_yaw - drone_yaw)
+                if abs(yaw_err) >= self.YAW_DEADBAND_RAD:
+                    kp_yaw = (
+                        self.YAW_KP_DESCEND if phase in (PHASE_DESCEND, PHASE_LAND)
+                        else self.YAW_KP_APPROACH
+                    )
+                    rate_max = (
+                        self.YAW_RATE_MAX_APPROACH if phase == PHASE_APPROACH
+                        else self.YAW_RATE_MAX_LAND
+                    )
+                    yaw_rate_cmd = float(np.clip(kp_yaw * yaw_err, -rate_max, rate_max))
 
         # NaN/Inf guard. Per contracts.md the four setpoints MUST be finite
         # — collapse any anomaly to the safe-hover setpoint rather than
